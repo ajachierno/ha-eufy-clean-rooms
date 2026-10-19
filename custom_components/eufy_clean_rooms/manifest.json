@@ -1,0 +1,13 @@
+{
+  "domain": "eufy_clean_rooms",
+  "name": "Eufy Clean Rooms",
+  "codeowners": ["@ajachierno"],
+  "config_flow": true,
+  "documentation": "https://github.com/ajachierno/ha-eufy-clean-rooms",
+  "integration_type": "device",
+  "iot_class": "cloud_push",
+  "issue_tracker": "https://github.com/ajachierno/ha-eufy-clean-rooms/issues",
+  "loggers": ["custom_components.eufy_clean_rooms"],
+  "requirements": ["paho-mqtt>=2.0.0"],
+  "version": "0.1.0"
+}

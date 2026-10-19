@@ -1,0 +1,58 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Eufy account",
+        "description": "Log in with the same email and password you use in the Eufy Clean app.",
+        "data": {"email": "Email", "password": "Password"}
+      },
+      "device": {
+        "title": "Choose robot",
+        "data": {"device_sn": "Robot"}
+      },
+      "reauth_confirm": {
+        "title": "Log in again",
+        "description": "Eufy rejected the saved password. Enter it again.",
+        "data": {"password": "Password"}
+      }
+    },
+    "error": {
+      "invalid_auth": "Eufy rejected that email or password.",
+      "cannot_connect": "Couldn't reach the Eufy cloud. Try again in a minute.",
+      "no_devices": "This account has no robots on Eufy's MQTT cloud. Older Tuya-only models aren't supported."
+    },
+    "abort": {
+      "already_configured": "That robot is already set up.",
+      "reauth_successful": "Logged in again."
+    }
+  },
+  "entity": {
+    "sensor": {
+      "task": {"name": "Task"},
+      "rooms": {"name": "Rooms"},
+      "error": {"name": "Error code"}
+    }
+  },
+  "selector": {
+    "clean_type": {
+      "options": {"vacuum": "Vacuum", "mop": "Mop", "vacuum_and_mop": "Vacuum and mop"}
+    }
+  },
+  "services": {
+    "clean_rooms": {
+      "name": "Clean rooms",
+      "description": "Send the robot to clean specific rooms, by name or room ID.",
+      "fields": {
+        "rooms": {"name": "Rooms", "description": "Room names as they appear in the Eufy app, or room IDs."},
+        "clean_type": {"name": "Clean type", "description": "Vacuum, mop, or both. Leave empty to use the robot's current setting."},
+        "fan_speed": {"name": "Suction", "description": "Suction level for this run."},
+        "mop_level": {"name": "Mop water level", "description": "Water flow when mopping."},
+        "clean_times": {"name": "Passes", "description": "How many times to clean each room."}
+      }
+    },
+    "refresh_rooms": {
+      "name": "Refresh rooms",
+      "description": "Re-read the robot's room list from the Eufy cloud."
+    }
+  }
+}
