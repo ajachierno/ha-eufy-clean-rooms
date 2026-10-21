@@ -9,6 +9,7 @@ from homeassistant.const import ATTR_ENTITY_ID, Platform
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError
 from homeassistant.helpers import config_validation as cv, entity_registry as er
+from homeassistant.helpers.typing import ConfigType
 from homeassistant.helpers.update_coordinator import UpdateFailed
 
 from .const import (
@@ -23,6 +24,8 @@ from .const import (
     SERVICE_CLEAN_ROOMS,
 )
 from .coordinator import EufyCleanCoordinator
+
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 PLATFORMS = [Platform.VACUUM, Platform.BUTTON, Platform.SENSOR]
 
@@ -40,6 +43,11 @@ CLEAN_ROOMS_SCHEMA = vol.Schema(
 )
 
 
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    _register_services(hass)
+    return True
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: EufyCleanConfigEntry) -> bool:
     coordinator = EufyCleanCoordinator(hass, entry)
     try:
@@ -49,9 +57,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: EufyCleanConfigEntry) ->
         raise ConfigEntryNotReady(str(err)) from err
     entry.runtime_data = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-
-    if not hass.services.has_service(DOMAIN, SERVICE_CLEAN_ROOMS):
-        _register_services(hass)
     return True
 
 

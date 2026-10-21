@@ -1,0 +1,6 @@
+homeassistant==2026.10.2
+pytest==9.0.3
+pytest-homeassistant-custom-component==0.13.373
+# Pinned because tests/conftest.py's Windows socket shim uses pytest-socket internals.
+pytest-socket==0.8.1
+paho-mqtt>=2.0.0
