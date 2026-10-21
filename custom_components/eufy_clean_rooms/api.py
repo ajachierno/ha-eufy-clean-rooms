@@ -38,6 +38,15 @@ class EufyApiError(Exception):
     """Cloud request failed."""
 
 
+def _describe(data: Any, status: int) -> str:
+    """Short, credential-free summary of an Eufy error response."""
+    if isinstance(data, dict):
+        code = data.get("res_code", data.get("code"))
+        msg = data.get("message") or data.get("msg") or ""
+        return f"HTTP {status}, code {code}: {msg}".strip()
+    return f"HTTP {status}"
+
+
 class EufyCloud:
     """Talks to the Eufy account REST APIs."""
 
@@ -51,17 +60,23 @@ class EufyCloud:
         self._gtoken: str | None = None
 
     async def login(self) -> None:
-        """Log in, trying the unified eufy app first, then the Eufy Clean app."""
-        last: Any = None
+        """Log in and obtain the user-center token the MQTT APIs need.
+
+        Accounts moved to the unified eufy app sometimes authenticate on one
+        endpoint but get no user center from it, so every endpoint is tried and
+        the first one that yields a user center wins.
+        """
+        rejections: list[str] = []
+        got_token = False
+        network_error: Exception | None = None
         for url, client_id, secret, category in LOGIN_CONFIGS:
             headers = {
                 "category": category,
+                "Accept": "*/*",
                 "openudid": self.openudid,
                 "clientType": "1",
                 "User-Agent": USER_AGENT,
                 "Content-Type": "application/json",
-                "language": "en",
-                "country": "US",
             }
             body = {
                 "email": self._email,
@@ -71,33 +86,56 @@ class EufyCloud:
             }
             try:
                 async with self._session.post(url, json=body, headers=headers, timeout=_TIMEOUT) as resp:
+                    status = resp.status
                     data = await resp.json(content_type=None)
             except (aiohttp.ClientError, TimeoutError, ValueError) as err:
-                last = err
+                _LOGGER.warning("Eufy login via %s failed to connect: %s", client_id, err)
+                network_error = err
                 continue
-            if data and data.get("access_token"):
-                self._access_token = data["access_token"]
-                await self._load_user_center()
+            if not isinstance(data, dict) or not data.get("access_token"):
+                reason = _describe(data, status)
+                _LOGGER.warning("Eufy login via %s rejected: %s", client_id, reason)
+                rejections.append(reason)
+                continue
+            got_token = True
+            self._access_token = data["access_token"]
+            if await self._load_user_center(client_id):
+                _LOGGER.debug("Eufy login via %s succeeded", client_id)
                 return
-            last = data
-        if isinstance(last, dict) and last.get("res_code") in (26006, 26050, 26052, 100033):
-            raise EufyAuthError(last.get("message") or "invalid credentials")
-        raise EufyAuthError(f"login failed: {last}")
 
-    async def _load_user_center(self) -> None:
+        if got_token:
+            raise EufyApiError(
+                "Eufy accepted the login but returned no user center for this account"
+            )
+        if rejections:
+            raise EufyAuthError("; ".join(rejections))
+        raise EufyApiError(f"could not reach the Eufy login server: {network_error}")
+
+    async def _load_user_center(self, client_id: str) -> bool:
         headers = {
-            "token": self._access_token,
+            "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "token": self._access_token or "",
             "openudid": self.openudid,
             "user-agent": USER_AGENT,
             "category": "Home",
             "clienttype": "2",
         }
-        data = await self._get(URL_USER_INFO, headers)
-        center_id = data.get("user_center_id")
+        try:
+            async with self._session.get(URL_USER_INFO, headers=headers, timeout=_TIMEOUT) as resp:
+                status = resp.status
+                data = await resp.json(content_type=None)
+        except (aiohttp.ClientError, TimeoutError, ValueError) as err:
+            _LOGGER.warning("Eufy user info via %s failed: %s", client_id, err)
+            return False
+        center_id = data.get("user_center_id") if isinstance(data, dict) else None
         if not center_id:
-            raise EufyApiError("no user_center_id in user info")
+            _LOGGER.warning(
+                "Eufy login via %s has no user center: %s", client_id, _describe(data, status)
+            )
+            return False
         self._user_center_token = data.get("user_center_token")
         self._gtoken = hashlib.md5(center_id.encode()).hexdigest()
+        return True
 
     def _aiot_headers(self) -> dict[str, str]:
         return {

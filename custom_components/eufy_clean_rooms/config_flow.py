@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import logging
 from typing import Any
 import uuid
 
@@ -15,6 +16,8 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from .api import EufyApiError, EufyAuthError, EufyCloud
 from .const import CONF_DEVICE_MODEL, CONF_DEVICE_NAME, CONF_DEVICE_SN, CONF_OPENUDID, DOMAIN
 
+_LOGGER = logging.getLogger(__name__)
+
 USER_SCHEMA = vol.Schema({vol.Required(CONF_EMAIL): str, vol.Required(CONF_PASSWORD): str})
 
 
@@ -24,27 +27,36 @@ class EufyCleanRoomsConfigFlow(ConfigFlow, domain=DOMAIN):
     def __init__(self) -> None:
         self._login: dict[str, Any] = {}
         self._devices: dict[str, dict[str, Any]] = {}
+        self._details = ""
 
     async def _try_login(self, email: str, password: str, openudid: str) -> tuple[EufyCloud | None, str | None]:
-        cloud = EufyCloud(async_get_clientsession(self.hass), email, password, openudid)
+        cloud = EufyCloud(async_get_clientsession(self.hass), email.strip(), password, openudid)
         try:
             await cloud.login()
-        except EufyAuthError:
+        except EufyAuthError as err:
+            self._details = str(err)
             return None, "invalid_auth"
-        except EufyApiError:
+        except EufyApiError as err:
+            self._details = str(err)
             return None, "cannot_connect"
+        except Exception as err:  # noqa: BLE001 - surface anything unexpected in the form
+            _LOGGER.exception("Unexpected error logging in to Eufy")
+            self._details = f"{type(err).__name__}: {err}"
+            return None, "unknown"
         return cloud, None
 
     async def async_step_user(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         errors: dict[str, str] = {}
         if user_input is not None:
             openudid = uuid.uuid4().hex
+            user_input = {**user_input, CONF_EMAIL: user_input[CONF_EMAIL].strip()}
             cloud, error = await self._try_login(user_input[CONF_EMAIL], user_input[CONF_PASSWORD], openudid)
             if cloud:
                 try:
                     devices = await cloud.get_mqtt_devices()
-                except EufyApiError:
+                except EufyApiError as err:
                     devices, error = [], "cannot_connect"
+                    self._details = str(err)
                 if not error:
                     names = {
                         d.get("id"): d.get("alias_name") or d.get("name")
@@ -65,7 +77,14 @@ class EufyCleanRoomsConfigFlow(ConfigFlow, domain=DOMAIN):
             else:
                 self._login = {**user_input, CONF_OPENUDID: openudid}
                 return await self.async_step_device()
-        return self.async_show_form(step_id="user", data_schema=USER_SCHEMA, errors=errors)
+        return self.async_show_form(
+            step_id="user",
+            data_schema=self.add_suggested_values_to_schema(
+                USER_SCHEMA, {CONF_EMAIL: (user_input or {}).get(CONF_EMAIL, "")}
+            ),
+            errors=errors,
+            description_placeholders={"details": self._details},
+        )
 
     async def async_step_device(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         if user_input is not None or len(self._devices) == 1:
@@ -107,4 +126,5 @@ class EufyCleanRoomsConfigFlow(ConfigFlow, domain=DOMAIN):
             step_id="reauth_confirm",
             data_schema=vol.Schema({vol.Required(CONF_PASSWORD): str}),
             errors=errors,
+            description_placeholders={"details": self._details},
         )
