@@ -58,13 +58,20 @@ class EufyCloud:
         self._access_token: str | None = None
         self._user_center_token: str | None = None
         self._gtoken: str | None = None
+        # user_id from the login response: the Tuya cloud login is keyed on it.
+        self.user_id: str | None = None
+        # False for accounts Eufy never gave a user center (Tuya-only robots);
+        # the MQTT APIs are unavailable to them, everything else still works.
+        self.has_user_center = False
 
     async def login(self) -> None:
-        """Log in and obtain the user-center token the MQTT APIs need.
+        """Log in and, when the account has one, obtain the user-center token.
 
         Accounts moved to the unified eufy app sometimes authenticate on one
         endpoint but get no user center from it, so every endpoint is tried and
-        the first one that yields a user center wins.
+        the first one that yields a user center wins. An account with a token
+        but no user center at all is still logged in (has_user_center=False):
+        its robots are reachable over the Tuya cloud, not MQTT.
         """
         rejections: list[str] = []
         got_token = False
@@ -99,14 +106,19 @@ class EufyCloud:
                 continue
             got_token = True
             self._access_token = data["access_token"]
+            self.user_id = self.user_id or data.get("user_id")
             if await self._load_user_center(client_id):
+                self.has_user_center = True
                 _LOGGER.debug("Eufy login via %s succeeded", client_id)
                 return
 
         if got_token:
-            raise EufyApiError(
-                "Eufy accepted the login but returned no user center for this account"
+            self.has_user_center = False
+            _LOGGER.info(
+                "Eufy accepted the login but has no user center for this account; "
+                "only Tuya-cloud robots can be used"
             )
+            return
         if rejections:
             raise EufyAuthError("; ".join(rejections))
         raise EufyApiError(f"could not reach the Eufy login server: {network_error}")
@@ -173,8 +185,12 @@ class EufyCloud:
             raise EufyApiError(f"POST {url}: {data.get('code')} {data.get('msg')}")
         return data.get("data", data) or {}
 
+    _NO_USER_CENTER = "this account has no Eufy user center; MQTT robots are not available"
+
     async def get_mqtt_devices(self) -> list[dict[str, Any]]:
         """Devices reachable over the Eufy MQTT channel (the ones we can drive)."""
+        if not self.has_user_center:
+            raise EufyApiError(self._NO_USER_CENTER)
         data = await self._post(URL_AIOT_DEVICES, {"attribute": 3})
         return [d.get("device", d) for d in data.get("devices") or []]
 
@@ -194,12 +210,16 @@ class EufyCloud:
         return data.get("devices") or []
 
     async def get_device(self, device_sn: str) -> dict[str, Any] | None:
+        if not self.has_user_center:
+            return None
         for dev in await self.get_mqtt_devices():
             if dev.get("device_sn") == device_sn:
                 return dev
         return None
 
     async def get_mqtt_credentials(self) -> dict[str, Any]:
+        if not self.has_user_center:
+            raise EufyApiError(self._NO_USER_CENTER)
         data = await self._post(URL_MQTT_INFO)
         if not data.get("certificate_pem"):
             raise EufyApiError("no MQTT certificate returned")

@@ -45,13 +45,28 @@ async def test_wrong_password_is_auth_error(hass: HomeAssistant, aioclient_mock)
         await cloud.login()
 
 
-async def test_token_without_any_user_center_is_api_error(hass: HomeAssistant, aioclient_mock) -> None:
-    aioclient_mock.post(V2_URL, json={"access_token": "t"})
-    aioclient_mock.post(V1_URL, json={"access_token": "t"})
+async def test_token_without_any_user_center_still_logs_in(hass: HomeAssistant, aioclient_mock) -> None:
+    """Tuya-only accounts never get a user center; the login must still yield the user id."""
+    aioclient_mock.post(V2_URL, json={"access_token": "t", "user_id": "uid-1"})
+    aioclient_mock.post(V1_URL, json={"access_token": "t", "user_id": "uid-1"})
     aioclient_mock.get(URL_USER_INFO, json={"data": None})
     cloud = EufyCloud(async_get_clientsession(hass), "a@b.c", "pw", "udid")
-    with pytest.raises(EufyApiError, match="no user center"):
-        await cloud.login()
+    await cloud.login()
+    assert cloud.has_user_center is False and cloud.user_id == "uid-1"
+    with pytest.raises(EufyApiError, match="user center"):
+        await cloud.get_mqtt_devices()
+    with pytest.raises(EufyApiError, match="user center"):
+        await cloud.get_mqtt_credentials()
+    assert await cloud.get_device("x") is None
+    assert all(c[0] == "POST" or str(c[1]) == URL_USER_INFO for c in aioclient_mock.mock_calls)
+
+
+async def test_user_id_captured_with_user_center(hass: HomeAssistant, aioclient_mock) -> None:
+    aioclient_mock.post(V2_URL, json={"access_token": "t", "user_id": "uid-1"})
+    aioclient_mock.get(URL_USER_INFO, json={"user_center_id": "uc1", "user_center_token": "uct"})
+    cloud = EufyCloud(async_get_clientsession(hass), "a@b.c", "pw", "udid")
+    await cloud.login()
+    assert cloud.has_user_center is True and cloud.user_id == "uid-1"
 
 
 async def test_form_shows_eufy_reason(hass: HomeAssistant, aioclient_mock) -> None:
