@@ -87,5 +87,11 @@
       "name": "Refresh rooms",
       "description": "Re-read the robot's room list from the Eufy cloud."
     }
+  },
+  "issues": {
+    "dock_unreachable": {
+      "title": "Can't reach {name} on your network",
+      "description": "Eufy Clean Rooms reads the room list from the robot over your local network and can't connect to its dock. Make sure Home Assistant and the dock are on the same network, or set the dock's IP address in the integration's options. The last known rooms are still in use."
+    }
   }
 }

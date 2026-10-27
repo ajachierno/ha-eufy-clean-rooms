@@ -24,4 +24,4 @@ class EufyCleanEntity(CoordinatorEntity[EufyCleanCoordinator]):
 
     @property
     def available(self) -> bool:
-        return self.coordinator.mqtt_connected
+        return self.coordinator.connected

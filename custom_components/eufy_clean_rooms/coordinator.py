@@ -1,11 +1,11 @@
-"""Push coordinator: owns the MQTT link, robot state and the room list."""
+"""Coordinator: owns the link to the robot (MQTT or Tuya cloud), its state and the room list."""
 
 from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from datetime import timedelta
 import logging
+import time
 from typing import Any
 
 from homeassistant.components.vacuum import VacuumActivity
@@ -13,6 +13,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.storage import Store
@@ -23,7 +24,10 @@ from .api import EufyApiError, EufyAuthError, EufyCloud, EufyMqtt
 from .const import (
     CONF_DEVICE_MODEL,
     CONF_DEVICE_SN,
+    CONF_DOCK_HOST,
     CONF_OPENUDID,
+    CONF_TRANSPORT,
+    CONF_TUYA_REGION,
     DOMAIN,
     DPS_BATTERY,
     DPS_BATTERY_ALT,
@@ -37,13 +41,26 @@ from .const import (
     DPS_WORK_STATUS,
     FAN_SPEEDS,
     SIGNAL_ROOMS_UPDATED,
+    TRANSPORT_MQTT,
+    TRANSPORT_TUYA,
+    TUYA_REGION_ORDER,
+    ZERO_BASED_ORDER_MODELS,
 )
+from .rooms_p2p import DockBusy, DockUnreachable, RoomsUnavailable, fetch_rooms, find_dock_host, probe_dock
+from .transport import MqttTransport, Transport, TuyaTransport
+from .tuya import TuyaCloud, TuyaError, async_tuya_login
 
 _LOGGER = logging.getLogger(__name__)
 
-# MQTT is push; this slow poll only backfills state if a push was missed.
-POLL_INTERVAL = timedelta(minutes=10)
 STORAGE_VERSION = 1
+# A stored room table younger than this is used as-is at startup; older ones
+# are refreshed over P2P (each P2P session costs the robot a session slot).
+ROOMS_MAX_AGE = 24 * 3600
+# Busy dock (its few local connections are taken): short retries, no fuss.
+BUSY_RETRIES = 5
+BUSY_RETRY_SECONDS = 60
+# Unreachable dock: back off, raise a repair issue, keep the last known rooms.
+UNREACHABLE_BACKOFF = (300, 1800)
 
 _ALT_FAN = {"gentle": "Quiet", "normal": "Standard", "strong": "Turbo", "max": "Max"}
 
@@ -70,10 +87,11 @@ class EufyCleanCoordinator(DataUpdateCoordinator[RobotState]):
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         super().__init__(
             hass, _LOGGER, name=f"{DOMAIN} {entry.title}", config_entry=entry,
-            update_interval=POLL_INTERVAL,
+            update_interval=MqttTransport.poll_interval,
         )
         self.device_sn: str = entry.data[CONF_DEVICE_SN]
         self.device_model: str = entry.data[CONF_DEVICE_MODEL]
+        self.transport_kind: str = entry.data.get(CONF_TRANSPORT) or TRANSPORT_MQTT
         self.cloud = EufyCloud(
             async_get_clientsession(hass),
             entry.data[CONF_EMAIL],
@@ -81,7 +99,16 @@ class EufyCleanCoordinator(DataUpdateCoordinator[RobotState]):
             entry.data[CONF_OPENUDID],
         )
         self.mqtt: EufyMqtt | None = None
-        self.mqtt_connected = False
+        self.tuya: TuyaCloud | None = None
+        self.transport: Transport | None = None
+        self.connected = False
+        self.rooms_task: asyncio.Task[None] | None = None
+        self._local_key = ""
+        self._dock_host: str | None = None
+        self._rooms_fetched_at = 0.0
+        self._rooms_lock = asyncio.Lock()
+        self._p2p_failures = 0
+        self._p2p_backoff_until = 0.0
         self._store: Store[dict[str, Any]] = Store(
             hass, STORAGE_VERSION, f"{DOMAIN}.{self.device_sn}"
         )
@@ -90,19 +117,30 @@ class EufyCleanCoordinator(DataUpdateCoordinator[RobotState]):
     # ------------------------------------------------------------ lifecycle
 
     async def async_start(self) -> None:
-        """Log in, load saved rooms, seed state from the cloud, open MQTT."""
+        """Log in, load saved rooms, seed state from the cloud, open the transport."""
         if saved := await self._store.async_load():
             self.data.map_id = saved.get("map_id", 0)
             self.data.rooms = [proto.Room(r["id"], r["name"]) for r in saved.get("rooms", [])]
+            self._rooms_fetched_at = float(saved.get("fetched_at") or 0)
+            self._dock_host = saved.get("dock_host")
 
         try:
             await self.cloud.login()
-            device = await self.cloud.get_device(self.device_sn)
-            creds = await self.cloud.get_mqtt_credentials()
+            if self.transport_kind == TRANSPORT_TUYA:
+                await self._async_start_tuya()
+            else:
+                await self._async_start_mqtt()
         except EufyAuthError as err:
             raise ConfigEntryAuthFailed(str(err)) from err
         except EufyApiError as err:
             raise UpdateFailed(str(err)) from err
+        assert self.transport is not None
+        self.update_interval = self.transport.poll_interval
+        self.async_set_updated_data(self.data)
+
+    async def _async_start_mqtt(self) -> None:
+        device = await self.cloud.get_device(self.device_sn)
+        creds = await self.cloud.get_mqtt_credentials()
         if device is None:
             raise UpdateFailed(
                 f"{self.device_sn} is not in the Eufy MQTT device list; this robot "
@@ -122,26 +160,58 @@ class EufyCleanCoordinator(DataUpdateCoordinator[RobotState]):
 
         if dps := device.get("dps"):
             self._apply_dps(dps)
-        await self.mqtt.connect()
-        self.async_set_updated_data(self.data)
+        self.transport = MqttTransport(self.mqtt, self.cloud, self.device_sn)
+        await self.transport.start()
+
+    async def _async_start_tuya(self) -> None:
+        if not self.cloud.user_id:
+            raise UpdateFailed("Eufy login returned no user id; cannot log in to the Tuya cloud")
+        entry = self.config_entry
+        stored_region = entry.data.get(CONF_TUYA_REGION)
+        regions = (stored_region,) if stored_region else TUYA_REGION_ORDER
+        try:
+            self.tuya = await async_tuya_login(async_get_clientsession(self.hass), self.cloud.user_id, regions)
+            devices = await self.tuya.get_devices()
+        except TuyaError as err:
+            raise UpdateFailed(f"Tuya cloud: {err}") from err
+        if self.tuya.region != stored_region:
+            self.hass.config_entries.async_update_entry(
+                entry, data={**entry.data, CONF_TUYA_REGION: self.tuya.region}
+            )
+        device = next((d for d in devices if d.get("devId") == self.device_sn), None)
+        if device is None:
+            raise UpdateFailed(f"{self.device_sn} is not in the Tuya device list for this account")
+        self._local_key = device.get("localKey") or ""
+        if dps := device.get("dps"):
+            self._apply_dps(dps)
+        self.transport = TuyaTransport(self.tuya, self.device_sn, self._async_tuya_relogin)
+        await self.transport.start()
+        self.connected = True
+        if not self.data.rooms or time.time() - self._rooms_fetched_at > ROOMS_MAX_AGE:
+            self.rooms_task = entry.async_create_background_task(
+                self.hass, self._async_refresh_rooms_p2p(), f"{DOMAIN} rooms {self.device_sn}"
+            )
+
+    async def _async_tuya_relogin(self) -> None:
+        assert self.tuya is not None and self.cloud.user_id
+        await self.tuya.login(self.cloud.user_id)
 
     async def async_stop(self) -> None:
-        if self.mqtt:
-            await self.mqtt.disconnect()
+        if self.rooms_task and not self.rooms_task.done():
+            self.rooms_task.cancel()
+        if self.transport:
+            await self.transport.stop()
 
     async def _async_update_data(self) -> RobotState:
-        """Slow backfill poll of the cloud's last-known DPS snapshot."""
+        """Poll the cloud's last-known DPS snapshot (the only updates on Tuya; backfill on MQTT)."""
+        assert self.transport is not None
         try:
-            device = await self.cloud.get_device(self.device_sn)
-        except EufyApiError:
-            try:
-                await self.cloud.login()
-                device = await self.cloud.get_device(self.device_sn)
-            except EufyAuthError as err:
-                raise ConfigEntryAuthFailed(str(err)) from err
-            except EufyApiError as err:
-                raise UpdateFailed(str(err)) from err
-        if device and (dps := device.get("dps")):
+            dps = await self.transport.poll()
+        except EufyAuthError as err:
+            raise ConfigEntryAuthFailed(str(err)) from err
+        except EufyApiError as err:
+            raise UpdateFailed(str(err)) from err
+        if dps:
             self._apply_dps(dps)
         return self.data
 
@@ -149,7 +219,7 @@ class EufyCleanCoordinator(DataUpdateCoordinator[RobotState]):
 
     @callback
     def _handle_connection(self, connected: bool) -> None:
-        self.mqtt_connected = connected
+        self.connected = connected
         self.async_update_listeners()
 
     @callback
@@ -194,22 +264,115 @@ class EufyCleanCoordinator(DataUpdateCoordinator[RobotState]):
     def _set_rooms(self, table: proto.RoomTable) -> None:
         state = self.data
         new = [(r.id, r.name) for r in table.rooms]
+        self._rooms_fetched_at = time.time()
         if new == [(r.id, r.name) for r in state.rooms] and table.map_id == state.map_id:
+            self._save_rooms()
             return
         _LOGGER.info("Eufy room list for %s: %s", self.device_sn, [n for _, n in new])
         state.rooms, state.map_id = table.rooms, table.map_id
-        self._store.async_delay_save(
-            lambda: {"map_id": state.map_id, "rooms": [{"id": i, "name": n} for i, n in new]}, 1
-        )
+        self._save_rooms()
         async_dispatcher_send(self.hass, SIGNAL_ROOMS_UPDATED.format(self.device_sn))
+
+    def _save_rooms(self) -> None:
+        state = self.data
+        self._store.async_delay_save(
+            lambda: {
+                "map_id": state.map_id,
+                "rooms": [{"id": r.id, "name": r.name} for r in state.rooms],
+                "fetched_at": self._rooms_fetched_at,
+                "dock_host": self._dock_host,
+            },
+            1,
+        )
+
+    # ------------------------------------------------------------ rooms over P2P
+
+    @property
+    def _issue_id(self) -> str:
+        return f"dock_unreachable_{self.device_sn}"
+
+    async def _async_refresh_rooms_p2p(self, *, force: bool = False) -> None:
+        """One P2P session to the dock for the room table. Never raises."""
+        if self._rooms_lock.locked():
+            return
+        async with self._rooms_lock:
+            if not force and time.monotonic() < self._p2p_backoff_until:
+                return
+            try:
+                await self._fetch_rooms_once()
+            except Exception:  # noqa: BLE001 - a room refresh must never take the entry down
+                _LOGGER.exception("Unexpected error reading the room list over P2P")
+
+    async def _fetch_rooms_once(self) -> None:
+        assert self.tuya is not None
+        host = self.config_entry.data.get(CONF_DOCK_HOST) or self._dock_host
+        if not host:
+            host = await find_dock_host(self.device_sn)
+            if not host:
+                self._dock_unreachable("the dock did not answer discovery on this network")
+                return
+            self._dock_host = host
+        # The dock must be taking connections before the cloud reserves a session slot.
+        for attempt in range(BUSY_RETRIES + 1):
+            try:
+                await probe_dock(host)
+                break
+            except DockBusy:
+                if attempt == BUSY_RETRIES:
+                    _LOGGER.info(
+                        "Dock %s is busy (its local connections are in use); room list not refreshed", host
+                    )
+                    return
+                await asyncio.sleep(BUSY_RETRY_SECONDS)
+            except DockUnreachable as err:
+                self._dock_unreachable(str(err))
+                return
+        try:
+            rtc = await self.tuya.get_rtc_config(self.device_sn)
+        except TuyaError as err:
+            _LOGGER.warning("Could not get P2P credentials from the Tuya cloud: %s", err)
+            return
+        if not rtc or not rtc.get("device_password"):
+            _LOGGER.warning("Tuya cloud returned no P2P credentials for %s", self.device_sn)
+            return
+        try:
+            table = await fetch_rooms(
+                host=host, local_key=self._local_key, device_id=self.device_sn, rtc=rtc
+            )
+        except DockBusy as err:
+            _LOGGER.info("Dock %s refused the P2P session: %s", host, err)
+            return
+        except RoomsUnavailable as err:
+            _LOGGER.warning("No room list from %s: %s", host, err)
+            return
+        self._p2p_failures = 0
+        self._p2p_backoff_until = 0.0
+        ir.async_delete_issue(self.hass, DOMAIN, self._issue_id)
+        self._set_rooms(table)
+
+    def _dock_unreachable(self, reason: str) -> None:
+        self._p2p_failures += 1
+        backoff = UNREACHABLE_BACKOFF[min(self._p2p_failures, len(UNREACHABLE_BACKOFF)) - 1]
+        self._p2p_backoff_until = time.monotonic() + backoff
+        _LOGGER.warning(
+            "Can't reach the dock of %s to read its rooms (%s); keeping the last known list",
+            self.config_entry.title, reason,
+        )
+        ir.async_create_issue(
+            self.hass, DOMAIN, self._issue_id,
+            is_fixable=False,
+            severity=ir.IssueSeverity.WARNING,
+            translation_key="dock_unreachable",
+            translation_placeholders={"name": self.config_entry.title},
+        )
 
     # ------------------------------------------------------------ outgoing
 
     async def async_send(self, dps: dict[str, Any]) -> None:
-        if not self.mqtt:
+        if not self.transport:
             raise HomeAssistantError("Eufy robot is not connected")
         try:
-            await self.mqtt.send(dps)
+            await self.transport.send(dps)
         except EufyApiError as err:
             raise HomeAssistantError(str(err)) from err
 
@@ -270,14 +433,24 @@ class EufyCleanCoordinator(DataUpdateCoordinator[RobotState]):
         if fan_speed and not _uses_param_fan(self.data.raw_dps):
             await self.async_set_fan_speed(fan_speed)
             await asyncio.sleep(1)
-        await self.async_send(
-            {DPS_MODE_CTRL: proto.select_rooms_clean(room_ids, self.data.map_id, clean_times)}
-        )
+        if self.transport_kind == TRANSPORT_TUYA:
+            # The firmware wants the local map id (1 = first saved map, from P2P)
+            # and, on the S1 Pro, zero-based room order slots.
+            payload = proto.select_rooms_clean(
+                room_ids, self.data.map_id or 1, clean_times,
+                zero_based_order=self.device_model.startswith(ZERO_BASED_ORDER_MODELS),
+            )
+        else:
+            payload = proto.select_rooms_clean(room_ids, self.data.map_id, clean_times)
+        await self.async_send({DPS_MODE_CTRL: payload})
         self.data.active_room_ids = room_ids
         self.async_update_listeners()
 
     async def async_refresh_rooms(self) -> None:
-        """Re-read the cloud snapshot; picks up a room list the robot already reported."""
+        """Re-read the rooms: a P2P session on Tuya robots, the cloud snapshot on MQTT."""
+        if self.transport_kind == TRANSPORT_TUYA:
+            await self._async_refresh_rooms_p2p(force=True)
+            return
         await self.async_request_refresh()
 
 

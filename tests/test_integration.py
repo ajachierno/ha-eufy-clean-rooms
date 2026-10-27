@@ -225,3 +225,10 @@ async def test_unload(hass: HomeAssistant, cloud, mqtt) -> None:
     entry = await setup(hass)
     assert await hass.config_entries.async_unload(entry.entry_id)
     mqtt.disconnect.assert_awaited()
+
+
+async def test_entry_without_transport_key_is_mqtt(hass: HomeAssistant, cloud, mqtt) -> None:
+    """Entries created before 0.2.0 have no transport key and must keep using MQTT."""
+    entry = await setup(hass)
+    assert entry.runtime_data.transport_kind == "mqtt"
+    assert sent(mqtt) == []

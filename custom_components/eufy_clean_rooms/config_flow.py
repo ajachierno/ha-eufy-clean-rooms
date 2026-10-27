@@ -15,6 +15,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import EufyApiError, EufyAuthError, EufyCloud
 from .const import CONF_DEVICE_MODEL, CONF_DEVICE_NAME, CONF_DEVICE_SN, CONF_OPENUDID, DOMAIN
+from .tuya import async_tuya_login  # noqa: F401 - wired into the flow in the next step
 
 _LOGGER = logging.getLogger(__name__)
 
