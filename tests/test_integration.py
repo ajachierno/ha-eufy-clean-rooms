@@ -52,6 +52,8 @@ def cloud():
          patch("custom_components.eufy_clean_rooms.config_flow.EufyCloud", cls):
         inst = cls.return_value
         inst.openudid = "udid"
+        inst.user_id = None  # no Tuya login attempted: this account only has MQTT robots
+        inst.has_user_center = True
         inst.login = AsyncMock()
         inst.get_mqtt_devices = AsyncMock(return_value=[DEVICE])
         inst.get_account_devices = AsyncMock(return_value=[])
