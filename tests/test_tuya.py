@@ -159,3 +159,18 @@ async def test_rtc_config_shape(hass: HomeAssistant, aioclient_mock) -> None:
         "ice_config": {"token": [1], "tcp_token": {"t": 1}, "log": {"l": 1}},
         "session": {"sessionId": "x"},
     }
+
+
+async def test_login_bad_result_is_tuya_error(hass: HomeAssistant, aioclient_mock) -> None:
+    tuya_mock(aioclient_mock, US, {"tuya.m.user.uid.token.create": TOKEN, "tuya.m.user.uid.password.login": None})
+    with pytest.raises(TuyaError, match="BAD_RESPONSE"):
+        await async_tuya_login(async_get_clientsession(hass), "uid-1", regions=("US",))
+
+
+async def test_login_redirect_keeps_a_known_region_key(hass: HomeAssistant, aioclient_mock) -> None:
+    tuya_mock(aioclient_mock, EU, {
+        "tuya.m.user.uid.token.create": TOKEN,
+        "tuya.m.user.uid.password.login": {"sid": "s1", "domain": {"mobileApiUrl": "https://a1.tuyaus.com", "regionCode": "AZ"}},
+    })
+    client = await async_tuya_login(async_get_clientsession(hass), "uid-1")
+    assert client.region == "US" and client.endpoint == TUYA_REGIONS["US"]

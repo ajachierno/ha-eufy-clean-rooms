@@ -108,6 +108,8 @@ class EufyCleanRoomsConfigFlow(ConfigFlow, domain=DOMAIN):
                 region = tuya.region
             except TuyaError as err:
                 _LOGGER.warning("Tuya cloud login failed; only MQTT robots can be offered: %s", err)
+            except Exception:  # noqa: BLE001 - a Tuya surprise must not block MQTT robots
+                _LOGGER.exception("Unexpected error talking to the Tuya cloud; only MQTT robots can be offered")
         for dev in tuya_devices:
             dev_id = dev.get("devId")
             if not dev_id or dev_id in self._devices or not dev.get("localKey"):

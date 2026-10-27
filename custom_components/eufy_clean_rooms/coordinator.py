@@ -11,11 +11,12 @@ from typing import Any
 from homeassistant.components.vacuum import VacuumActivity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
@@ -108,7 +109,7 @@ class EufyCleanCoordinator(DataUpdateCoordinator[RobotState]):
         self._rooms_fetched_at = 0.0
         self._rooms_lock = asyncio.Lock()
         self._p2p_failures = 0
-        self._p2p_backoff_until = 0.0
+        self._retry_unsub: CALLBACK_TYPE | None = None
         self._store: Store[dict[str, Any]] = Store(
             hass, STORAGE_VERSION, f"{DOMAIN}.{self.device_sn}"
         )
@@ -168,12 +169,22 @@ class EufyCleanCoordinator(DataUpdateCoordinator[RobotState]):
             raise UpdateFailed("Eufy login returned no user id; cannot log in to the Tuya cloud")
         entry = self.config_entry
         stored_region = entry.data.get(CONF_TUYA_REGION)
-        regions = (stored_region,) if stored_region else TUYA_REGION_ORDER
+        session = async_get_clientsession(self.hass)
         try:
-            self.tuya = await async_tuya_login(async_get_clientsession(self.hass), self.cloud.user_id, regions)
+            try:
+                regions = (stored_region,) if stored_region else TUYA_REGION_ORDER
+                self.tuya = await async_tuya_login(session, self.cloud.user_id, regions)
+            except TuyaError as err:
+                if not stored_region or err.code == "NETWORK":
+                    raise
+                # The stored region stopped working: probe them all once more.
+                _LOGGER.info("Tuya login in stored region %s failed (%s); trying all regions", stored_region, err)
+                self.tuya = await async_tuya_login(session, self.cloud.user_id, TUYA_REGION_ORDER)
             devices = await self.tuya.get_devices()
         except TuyaError as err:
             raise UpdateFailed(f"Tuya cloud: {err}") from err
+        except (KeyError, TypeError, ValueError) as err:
+            raise UpdateFailed(f"Tuya cloud returned an unexpected response: {err!r}") from err
         if self.tuya.region != stored_region:
             self.hass.config_entries.async_update_entry(
                 entry, data={**entry.data, CONF_TUYA_REGION: self.tuya.region}
@@ -188,15 +199,16 @@ class EufyCleanCoordinator(DataUpdateCoordinator[RobotState]):
         await self.transport.start()
         self.connected = True
         if not self.data.rooms or time.time() - self._rooms_fetched_at > ROOMS_MAX_AGE:
-            self.rooms_task = entry.async_create_background_task(
-                self.hass, self._async_refresh_rooms_p2p(), f"{DOMAIN} rooms {self.device_sn}"
-            )
+            self._start_rooms_task()
 
     async def _async_tuya_relogin(self) -> None:
         assert self.tuya is not None and self.cloud.user_id
         await self.tuya.login(self.cloud.user_id)
 
     async def async_stop(self) -> None:
+        if self._retry_unsub:
+            self._retry_unsub()
+            self._retry_unsub = None
         if self.rooms_task and not self.rooms_task.done():
             self.rooms_task.cancel()
         if self.transport:
@@ -291,21 +303,46 @@ class EufyCleanCoordinator(DataUpdateCoordinator[RobotState]):
     def _issue_id(self) -> str:
         return f"dock_unreachable_{self.device_sn}"
 
-    async def _async_refresh_rooms_p2p(self, *, force: bool = False) -> None:
+    @callback
+    def _start_rooms_task(self, *_: Any) -> None:
+        """Run one P2P room refresh in the background; a running one is left alone."""
+        if self._retry_unsub:
+            self._retry_unsub()
+            self._retry_unsub = None
+        if self.rooms_task and not self.rooms_task.done():
+            return
+        self.rooms_task = self.config_entry.async_create_background_task(
+            self.hass, self._async_refresh_rooms_p2p(), f"{DOMAIN} rooms {self.device_sn}"
+        )
+
+    async def _async_refresh_rooms_p2p(self) -> None:
         """One P2P session to the dock for the room table. Never raises."""
         if self._rooms_lock.locked():
             return
         async with self._rooms_lock:
-            if not force and time.monotonic() < self._p2p_backoff_until:
-                return
             try:
                 await self._fetch_rooms_once()
             except Exception:  # noqa: BLE001 - a room refresh must never take the entry down
                 _LOGGER.exception("Unexpected error reading the room list over P2P")
 
+    async def _probe(self, host: str) -> str:
+        """'ok', 'busy' (after the retries) or 'unreachable'."""
+        for attempt in range(BUSY_RETRIES + 1):
+            try:
+                await probe_dock(host)
+                return "ok"
+            except DockBusy:
+                if attempt == BUSY_RETRIES:
+                    return "busy"
+                await asyncio.sleep(BUSY_RETRY_SECONDS)
+            except DockUnreachable:
+                return "unreachable"
+        return "busy"
+
     async def _fetch_rooms_once(self) -> None:
         assert self.tuya is not None
-        host = self.config_entry.data.get(CONF_DOCK_HOST) or self._dock_host
+        configured = self.config_entry.data.get(CONF_DOCK_HOST)
+        host = configured or self._dock_host
         if not host:
             host = await find_dock_host(self.device_sn)
             if not host:
@@ -313,20 +350,21 @@ class EufyCleanCoordinator(DataUpdateCoordinator[RobotState]):
                 return
             self._dock_host = host
         # The dock must be taking connections before the cloud reserves a session slot.
-        for attempt in range(BUSY_RETRIES + 1):
-            try:
-                await probe_dock(host)
-                break
-            except DockBusy:
-                if attempt == BUSY_RETRIES:
-                    _LOGGER.info(
-                        "Dock %s is busy (its local connections are in use); room list not refreshed", host
-                    )
-                    return
-                await asyncio.sleep(BUSY_RETRY_SECONDS)
-            except DockUnreachable as err:
-                self._dock_unreachable(str(err))
-                return
+        result = await self._probe(host)
+        if result != "ok" and not configured:
+            # A remembered address may be stale (DHCP moved the dock, or another
+            # device now answers there); ask the network once before giving up.
+            fresh = await find_dock_host(self.device_sn)
+            if fresh and fresh != host:
+                _LOGGER.info("Dock of %s moved from %s to %s", self.config_entry.title, host, fresh)
+                host = self._dock_host = fresh
+                result = await self._probe(host)
+        if result == "busy":
+            _LOGGER.info("Dock %s is busy (its local connections are in use); room list not refreshed", host)
+            return
+        if result == "unreachable":
+            self._dock_unreachable(f"{host} does not answer")
+            return
         try:
             rtc = await self.tuya.get_rtc_config(self.device_sn)
         except TuyaError as err:
@@ -346,18 +384,19 @@ class EufyCleanCoordinator(DataUpdateCoordinator[RobotState]):
             _LOGGER.warning("No room list from %s: %s", host, err)
             return
         self._p2p_failures = 0
-        self._p2p_backoff_until = 0.0
         ir.async_delete_issue(self.hass, DOMAIN, self._issue_id)
         self._set_rooms(table)
 
     def _dock_unreachable(self, reason: str) -> None:
         self._p2p_failures += 1
-        backoff = UNREACHABLE_BACKOFF[min(self._p2p_failures, len(UNREACHABLE_BACKOFF)) - 1]
-        self._p2p_backoff_until = time.monotonic() + backoff
         _LOGGER.warning(
             "Can't reach the dock of %s to read its rooms (%s); keeping the last known list",
             self.config_entry.title, reason,
         )
+        # Try again later, a bounded number of times; after that it's up to Refresh rooms.
+        if self._p2p_failures <= len(UNREACHABLE_BACKOFF):
+            backoff = UNREACHABLE_BACKOFF[self._p2p_failures - 1]
+            self._retry_unsub = async_call_later(self.hass, backoff, self._start_rooms_task)
         ir.async_create_issue(
             self.hass, DOMAIN, self._issue_id,
             is_fixable=False,
@@ -416,6 +455,11 @@ class EufyCleanCoordinator(DataUpdateCoordinator[RobotState]):
         if not room_ids:
             raise HomeAssistantError("No rooms given")
         if not self.data.rooms:
+            if self.transport_kind == TRANSPORT_TUYA:
+                raise HomeAssistantError(
+                    "No room list from the robot yet; check Home Assistant can reach the dock "
+                    "on your network, then run Refresh rooms"
+                )
             raise HomeAssistantError(
                 "No room list received from the robot yet; open the map in the Eufy app once"
             )
@@ -449,7 +493,8 @@ class EufyCleanCoordinator(DataUpdateCoordinator[RobotState]):
     async def async_refresh_rooms(self) -> None:
         """Re-read the rooms: a P2P session on Tuya robots, the cloud snapshot on MQTT."""
         if self.transport_kind == TRANSPORT_TUYA:
-            await self._async_refresh_rooms_p2p(force=True)
+            self._p2p_failures = 0  # a manual refresh restarts the retry ladder
+            self._start_rooms_task()
             return
         await self.async_request_refresh()
 

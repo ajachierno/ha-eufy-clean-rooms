@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import MockConfigEntry, async_fire_time_changed
@@ -161,8 +162,9 @@ async def test_fresh_store_skips_p2p(hass: HomeAssistant, cloud, tuya, p2p, hass
 
 async def test_refresh_rooms_service_forces_p2p(hass: HomeAssistant, cloud, tuya, p2p, hass_storage) -> None:
     seed_store(hass_storage, [(2, "Kitchen")], fetched_at=time.time())
-    await setup(hass)
+    entry = await setup(hass)
     await hass.services.async_call(DOMAIN, "refresh_rooms", {"entity_id": "vacuum.robot"}, blocking=True)
+    await entry.runtime_data.rooms_task
     await hass.async_block_till_done()
     assert p2p.fetch.await_count == 1
     assert hass.states.get("button.robot_vacuum_laundry_room")
@@ -252,3 +254,96 @@ async def test_options_flow_aborts_for_mqtt_entry(hass: HomeAssistant, cloud, tu
     entry.add_to_hass(hass)
     result = await hass.config_entries.options.async_init(entry.entry_id)
     assert result["type"] is FlowResultType.ABORT and result["reason"] == "not_tuya"
+
+
+# ---------------------------------------------------------------- review fixes (liveness and recovery)
+
+import asyncio  # noqa: E402
+
+from custom_components.eufy_clean_rooms.tuya import TuyaSessionError  # noqa: E402
+
+
+async def test_tuya_unavailable_after_failed_polls_then_recovers(hass: HomeAssistant, cloud, tuya, p2p) -> None:
+    await setup(hass)
+    err = TuyaSessionError("USER_SESSION_LOSS", "gone")
+    tuya.get_dps.side_effect = [err, err]
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=31))
+    await hass.async_block_till_done()
+    assert hass.states.get("vacuum.robot").state == "unavailable"
+    assert hass.states.get("sensor.robot_battery").state == "unavailable"
+    tuya.get_dps.side_effect = None
+    tuya.get_dps.return_value = {"153": DOCKED}
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=62))
+    await hass.async_block_till_done()
+    assert hass.states.get("vacuum.robot").state == "docked"
+
+
+async def test_stale_cached_host_is_rediscovered(hass: HomeAssistant, cloud, tuya, p2p, hass_storage) -> None:
+    seed_store(hass_storage, [(2, "Kitchen")], fetched_at=0)
+    hass_storage[f"{DOMAIN}.{SN}"]["data"]["dock_host"] = "192.0.2.5"
+    p2p.probe.side_effect = [DockUnreachable("no route"), None]
+    p2p.find.return_value = "192.0.2.7"
+    await setup(hass)
+    assert [c.args for c in p2p.probe.await_args_list] == [("192.0.2.5",), ("192.0.2.7",)]
+    assert p2p.fetch.await_args.kwargs["host"] == "192.0.2.7"
+    assert issue(hass) is None
+
+
+async def test_refresh_service_returns_before_fetch_finishes(hass: HomeAssistant, cloud, tuya, p2p, hass_storage) -> None:
+    seed_store(hass_storage, [(2, "Kitchen")], fetched_at=time.time())
+    entry = await setup(hass)
+    gate = asyncio.Event()
+
+    async def slow_fetch(**kwargs):
+        await gate.wait()
+        return ROOMS
+
+    p2p.fetch.side_effect = slow_fetch
+    await asyncio.wait_for(
+        hass.services.async_call(DOMAIN, "refresh_rooms", {"entity_id": "vacuum.robot"}, blocking=True), 1
+    )
+    assert entry.runtime_data.rooms_task is not None and not entry.runtime_data.rooms_task.done()
+    gate.set()
+    await entry.runtime_data.rooms_task
+    await hass.async_block_till_done()
+    assert hass.states.get("button.robot_vacuum_laundry_room")
+
+
+async def test_unreachable_dock_retries_after_backoff(hass: HomeAssistant, cloud, tuya, p2p) -> None:
+    p2p.probe.side_effect = [DockUnreachable("no route"), DockUnreachable("no route"), None]
+    p2p.find.return_value = "192.0.2.5"
+    entry = await setup(hass)
+    assert p2p.probe.await_count == 1 and issue(hass) is not None
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=301))
+    await hass.async_block_till_done()
+    await entry.runtime_data.rooms_task
+    assert p2p.probe.await_count == 2
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=301 + 1801))
+    await hass.async_block_till_done()
+    await entry.runtime_data.rooms_task
+    await hass.async_block_till_done()
+    assert p2p.probe.await_count == 3
+    assert issue(hass) is None
+    assert hass.states.get("button.robot_vacuum_laundry_room")
+
+
+async def test_no_rooms_error_mentions_refresh_on_tuya(hass: HomeAssistant, cloud, tuya, p2p) -> None:
+    p2p.probe.side_effect = DockUnreachable("no route")
+    entry = await setup(hass)
+    with pytest.raises(HomeAssistantError, match="Refresh rooms"):
+        await entry.runtime_data.async_clean_rooms([1])
+
+
+async def test_config_flow_tuya_crash_still_offers_mqtt(hass: HomeAssistant, cloud, tuya) -> None:
+    cloud.has_user_center = True
+    cloud.get_mqtt_devices = AsyncMock(return_value=[MQTT_DEVICE])
+    tuya.login.side_effect = RuntimeError("unexpected shape")
+    result = await _start_flow(hass)
+    assert result["type"] is FlowResultType.CREATE_ENTRY and result["data"]["transport"] == "mqtt"
+
+
+async def test_stored_region_failure_falls_back_to_all_regions(hass: HomeAssistant, cloud, tuya, p2p) -> None:
+    tuya.login.side_effect = [TuyaError("USER_NOT_EXISTS", "no"), tuya]
+    entry = await setup(hass)
+    assert [c.args[2] for c in tuya.login.await_args_list] == [("US",), ("EU", "US")]
+    assert entry.data["tuya_region"] == "US"

@@ -113,25 +113,34 @@ class TuyaCloud:
             {"countryCode": self.region, "uid": uid},
             requires_sid=False,
         )
+        try:
+            passwd = _encrypt_password(uid, token["publicKey"], int(token["exponent"]))
+            login_token = token["token"]
+        except (KeyError, TypeError, ValueError) as err:
+            raise TuyaError("BAD_RESPONSE", "token.create returned no usable key") from err
         result = await self.request(
             "tuya.m.user.uid.password.login",
             {
                 "countryCode": self.region,
                 "uid": uid,
                 "createGroup": True,
-                "passwd": _encrypt_password(uid, token["publicKey"], int(token["exponent"])),
+                "passwd": passwd,
                 "ifencrypt": 1,
                 "options": {"group": 1},
-                "token": token["token"],
+                "token": login_token,
             },
             requires_sid=False,
         )
+        if not isinstance(result, dict) or not result.get("sid"):
+            raise TuyaError("BAD_RESPONSE", "password.login returned no session")
         domain = result.get("domain") or {}
         mobile_api_url = domain.get("mobileApiUrl")
-        if mobile_api_url and not self.endpoint.startswith(mobile_api_url):
+        if isinstance(mobile_api_url, str) and mobile_api_url and not self.endpoint.startswith(mobile_api_url):
             self.endpoint = mobile_api_url.rstrip("/") + "/api.json"
-            self.region = domain.get("regionCode", self.region)
-            _LOGGER.debug("Tuya redirected the session to region %s", self.region)
+            # Keep ``region`` one of our own keys (it is persisted and used to pick
+            # the endpoint next time); Tuya's regionCode values are not those keys.
+            self.region = next((k for k, v in TUYA_REGIONS.items() if v == self.endpoint), self.region)
+            _LOGGER.debug("Tuya redirected the session to %s", self.region)
         self.sid = result["sid"]
         _LOGGER.debug("Tuya login succeeded in region %s", self.region)
 

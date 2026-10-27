@@ -5,7 +5,7 @@ from __future__ import annotations
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import CONF_DEVICE_NAME, DOMAIN
+from .const import CONF_DEVICE_NAME, DOMAIN, TRANSPORT_TUYA
 from .coordinator import EufyCleanCoordinator
 
 
@@ -24,4 +24,9 @@ class EufyCleanEntity(CoordinatorEntity[EufyCleanCoordinator]):
 
     @property
     def available(self) -> bool:
-        return self.coordinator.connected
+        # MQTT robots: the broker connection is the liveness signal (unchanged).
+        # Tuya robots are polled, so a failing poll is the only signal there is.
+        coordinator = self.coordinator
+        if coordinator.transport_kind == TRANSPORT_TUYA:
+            return coordinator.connected and coordinator.last_update_success
+        return coordinator.connected
