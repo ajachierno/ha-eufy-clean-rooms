@@ -109,3 +109,75 @@ def test_codec() -> None:
 if __name__ == "__main__":
     test_codec()
     print("all proto tests passed")
+
+
+# ---------------------------------------------------------------- Tuya-transport additions
+
+proto = p  # the module loaded above
+
+
+def _rooms_of(value: str) -> dict[int, list]:
+    msg = proto.parse(proto.from_b64(value))
+    return proto.parse(msg[4][0])
+
+
+def test_select_rooms_clean_zero_based_order() -> None:
+    one_based = proto.select_rooms_clean([2, 1], 1)
+    zero_based = proto.select_rooms_clean([2, 1], 1, zero_based_order=True)
+    assert one_based != zero_based
+    sel = _rooms_of(zero_based)
+    rooms = [proto.parse(r) for r in sel[1]]
+    assert [proto._first(r, 1, 0) for r in rooms] == [2, 1]
+    assert [proto._first(r, 2, 0) for r in rooms] == [0, 1]
+    assert proto._first(sel, 3) == 1
+
+
+def test_select_rooms_clean_keeps_room_zero() -> None:
+    sel = _rooms_of(proto.select_rooms_clean([0], 1, zero_based_order=True))
+    assert len(sel[1]) == 1
+
+
+def test_select_rooms_clean_customize_mode() -> None:
+    sel = _rooms_of(proto.select_rooms_clean([3], 1, mode=proto.ROOMS_MODE_CUSTOMIZE))
+    assert proto._first(sel, 5) == 1
+    assert 5 not in _rooms_of(proto.select_rooms_clean([3], 1))
+
+
+def _p2p_map_object(map_info: bytes) -> bytes:
+    """One MapChannelMsg{type=MAP_INFO, map_info} as the P2P map stream delivers it."""
+    return base64.b64decode(proto.to_b64(proto.f_varint(1, 0) + proto.f_bytes(2, map_info)))
+
+
+def test_parse_p2p_room_table() -> None:
+    room_params = (
+        proto.f_bytes(2, proto.f_varint(1, 1) + proto.f_bytes(2, b"Laundry room"))
+        + proto.f_bytes(2, proto.f_varint(1, 0))
+        + proto.f_varint(3, 1)
+    )
+    map_info = proto.f_varint(2, 1) + proto.f_varint(8, 4) + proto.f_bytes(12, room_params)
+    table = proto.parse_p2p_room_table(_p2p_map_object(map_info))
+    assert table.map_id == 1
+    assert [(r.id, r.name) for r in table.rooms] == [(1, "Laundry room"), (0, "Room 0")]
+
+
+def test_parse_p2p_room_table_ignores_outline() -> None:
+    map_info = proto.f_varint(2, 1) + proto.f_varint(8, 1)
+    assert proto.parse_p2p_room_table(_p2p_map_object(map_info)) is None
+    assert proto.parse_p2p_room_table(b"\x00") is None
+    assert proto.parse_p2p_room_table(b"") is None
+
+
+def test_map_edit_rooms_custom() -> None:
+    value = proto.map_edit_rooms_custom([2, 5], 1, "mop", "Turbo", "high", 2)
+    msg = proto.parse(proto.from_b64(value))
+    assert proto._first(msg, 1) == 5 and proto._first(msg, 2) == 1 and proto._first(msg, 3) == 1
+    custom = proto._sub(msg, 10)
+    order = proto._sub(custom, 2)
+    assert [proto._first(proto.parse(r), 1) for r in order[1]] == [2, 5]
+    parm = proto._sub(custom, 3)
+    room = proto.parse(parm[1][0])
+    c = proto._sub(room, 2)
+    assert proto._first(proto._sub(c, 1), 1) == proto.CLEAN_TYPES["mop"]
+    assert proto._first(proto._sub(c, 2), 1) == proto.SUCTIONS["Turbo"]
+    assert proto._first(proto._sub(c, 3), 1) == proto.MOP_LEVELS["high"]
+    assert proto._first(c, 5) == 2

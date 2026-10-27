@@ -110,6 +110,17 @@ STOP_TASK = 12
 PAUSE_TASK = 13
 RESUME_TASK = 14
 
+# SelectRoomsClean.Mode (control.proto)
+ROOMS_MODE_GENERAL = 0
+ROOMS_MODE_CUSTOMIZE = 1
+
+# MapEditRequest.Method (map_edit.proto)
+MAP_EDIT_SET_ROOMS_CUSTOM = 5
+
+# MapChannelMsg / MapInfo (p2pdata.proto): the P2P map stream's envelope
+MAP_MSG_INFO = 0  # MapChannelMsg.type
+MAP_INFO_ROOM_PARAMS = 4  # MapInfo.msg_type
+
 # CleanType.Value (clean_param.proto)
 CLEAN_TYPES = {"vacuum": 0, "mop": 1, "vacuum_and_mop": 2, "vacuum_then_mop": 3}
 # Fan.Suction
@@ -145,15 +156,69 @@ def mode_ctrl(method: int) -> str:
     return to_b64(body)
 
 
-def select_rooms_clean(room_ids: list[int], map_id: int, clean_times: int = 1) -> str:
-    """ModeCtrlRequest{method=START_SELECT_ROOMS_CLEAN, select_rooms_clean{...}}."""
+def select_rooms_clean(
+    room_ids: list[int],
+    map_id: int,
+    clean_times: int = 1,
+    *,
+    zero_based_order: bool = False,
+    mode: int = ROOMS_MODE_GENERAL,
+) -> str:
+    """ModeCtrlRequest{method=START_SELECT_ROOMS_CLEAN, select_rooms_clean{...}}.
+
+    The T2080A (S1 Pro) treats Room.order as a zero-based slot: with 1-based
+    order it reads the empty slot 0 as room 0 and drops the last room, so Tuya
+    callers pass zero_based_order=True. Room id 0 is a real room and is kept.
+    """
     inner = b"".join(
         f_bytes(1, f_varint(1, rid) + f_varint(2, order))
-        for order, rid in enumerate(room_ids, start=1)
+        for order, rid in enumerate(room_ids, start=0 if zero_based_order else 1)
     )
     inner += f_varint(2, max(1, clean_times)) + f_varint(3, map_id)
-    # mode=GENERAL(0): clean params come from CleanParamRequest.area_clean_param
+    # mode=GENERAL(0): clean params come from CleanParamRequest.area_clean_param;
+    # CUSTOMIZE(1): per-room params set beforehand with map_edit_rooms_custom.
+    if mode:
+        inner += f_varint(5, mode)
     return to_b64(f_varint(1, START_SELECT_ROOMS_CLEAN) + f_bytes(4, inner))
+
+
+def map_edit_rooms_custom(
+    room_ids: list[int],
+    map_id: int,
+    clean_type: str | None,
+    suction: str | None,
+    mop_level: str | None,
+    clean_times: int,
+    seq: int = 1,
+) -> str:
+    """MapEditRequest{method=SET_ROOMS_CUSTOM, seq, map_id, rooms_custom=10{...}} for DPS 170.
+
+    RoomsCustom{rooms_order=2{rooms=1{id, order}}, rooms_parm=3{rooms=1{id,
+    custom=2{clean_type=1, fan=2, mop_mode=3, clean_times=5}}}}; rooms_custom is
+    field 10 of MapEditRequest's Param oneof (map_edit.proto). Each per-room
+    parameter is a one-field sub-message wrapping the enum value.
+    """
+    order = b"".join(
+        f_bytes(1, f_varint(1, rid) + f_varint(2, i)) for i, rid in enumerate(room_ids)
+    )
+    custom = b""
+    if clean_type is not None:
+        custom += f_bytes(1, f_varint(1, CLEAN_TYPES[clean_type]))
+    if suction is not None:
+        custom += f_bytes(2, f_varint(1, SUCTIONS[suction]))
+    if mop_level is not None:
+        custom += f_bytes(3, f_varint(1, MOP_LEVELS[mop_level]))
+    if clean_times:
+        custom += f_varint(5, clean_times)
+    parm = b"".join(f_bytes(1, f_varint(1, rid) + f_bytes(2, custom)) for rid in room_ids)
+    rooms_custom = f_bytes(2, order) + f_bytes(3, parm)
+    body = (
+        f_varint(1, MAP_EDIT_SET_ROOMS_CUSTOM)
+        + f_varint(2, seq)
+        + f_varint(3, map_id)
+        + f_bytes(10, rooms_custom)
+    )
+    return to_b64(body)
 
 
 def clean_param_request(
@@ -238,7 +303,11 @@ def parse_room_table(value: str) -> RoomTable | None:
         except (ValueError, UnicodeDecodeError, AttributeError):
             pass
 
-    # RoomParams: repeated Room rooms=2{id=1,name=2,scene=4}, map_id=3
+    return _room_params_table(msg)
+
+
+def _room_params_table(msg: dict[int, list[Any]]) -> RoomTable | None:
+    """RoomParams: repeated Room rooms=2{id=1,name=2,scene=4}, map_id=3."""
     if 2 in msg or 3 in msg:
         try:
             rooms = []
@@ -250,6 +319,44 @@ def parse_room_table(value: str) -> RoomTable | None:
         except (ValueError, UnicodeDecodeError, AttributeError):
             pass
     return None
+
+
+def parse_room_params(raw: bytes) -> RoomTable | None:
+    """Parse a bare (not base64, not length-prefixed) RoomParams message."""
+    try:
+        return _room_params_table(parse(raw))
+    except (ValueError, TypeError):
+        return None
+
+
+def parse_p2p_room_table(obj: bytes) -> RoomTable | None:
+    """Parse one length-delimited MapChannelMsg from the P2P map stream.
+
+    MapChannelMsg{type=1, map_info=2}; MapInfo{map_id=2, msg_type=8,
+    room_params=12}. Only ROOM_PARAMS messages carry the room table; every
+    other aspect (outline, obstacles, zones, ...) returns None. The local map
+    id comes from RoomParams.map_id, which is the id the firmware accepts in
+    room-clean commands.
+    """
+    if not obj:
+        return None
+    try:
+        length, pos = _read_varint(obj, 0)
+        msg = parse(obj[pos : pos + length])
+    except (ValueError, TypeError):
+        return None
+    if _first(msg, 1, 0) != MAP_MSG_INFO:
+        return None
+    info = _sub(msg, 2)
+    if not info or _first(info, 8, 0) != MAP_INFO_ROOM_PARAMS:
+        return None
+    raw = _first(info, 12)
+    if not isinstance(raw, bytes):
+        return None
+    table = parse_room_params(raw)
+    if table is not None and not table.map_id:
+        table.map_id = _first(info, 2, 0)
+    return table
 
 
 @dataclass
