@@ -35,6 +35,18 @@ def no_sleep():
         yield
 
 
+@pytest.fixture(autouse=True)
+def no_real_dock_discovery():
+    """Fail any test that reaches the real UDP dock discovery.
+
+    On Linux CI the HA test plugin blocks sockets; on Windows tests/conftest.py
+    lifts that guard, so without this a leak only shows up in CI.
+    """
+    with patch("custom_components.eufy_clean_rooms.rooms_p2p._listen_for_dock", return_value=None) as listen:
+        yield
+    assert not listen.called, "test reached real LAN dock discovery; use the p2p fixture"
+
+
 @pytest.fixture
 def cloud():
     with patch("custom_components.eufy_clean_rooms.coordinator.EufyCloud") as cls, \
@@ -202,13 +214,18 @@ async def _start_flow(hass: HomeAssistant):
     return await hass.config_entries.flow.async_configure(result["flow_id"], {CONF_EMAIL: "a@b.c", CONF_PASSWORD: "pw"})
 
 
-async def test_config_flow_lists_tuya_robot(hass: HomeAssistant, cloud, tuya) -> None:
+async def test_config_flow_lists_tuya_robot(hass: HomeAssistant, cloud, tuya, p2p) -> None:
     result = await _start_flow(hass)
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["title"] == "Robot"
     data = result["data"]
     assert data["transport"] == "tuya" and data["device_sn"] == SN
     assert data["device_model"] == "T2080A" and data["tuya_region"] == "US"
+    # Creating the entry sets it up, and setup starts the room fetch in the background.
+    await hass.async_block_till_done()
+    if task := result["result"].runtime_data.rooms_task:
+        await task
+    assert p2p.find.await_count == 1
 
 
 async def test_config_flow_mixed_account_offers_both(hass: HomeAssistant, cloud, tuya) -> None:
