@@ -10,13 +10,13 @@ Tell your Eufy robot vacuum to clean one specific room from Home Assistant: "vac
 
 This project wouldn't exist without **[tkoba1974/ha-eufy-robovac-s1-pro](https://github.com/tkoba1974/ha-eufy-robovac-s1-pro)**, the integration I used for my S1 Pro before writing this one. Its big strength is **local control**: after a one-time Eufy login to fetch the robot's encryption key, every command and status update stays on your own network. No cloud round trip, nothing breaks when Eufy's servers have a bad day, and nothing about your house leaves it. If you want basic control, consumable tracking and cleaning stats with zero cloud dependency, use that integration. It's excellent at it.
 
-The one thing it can't do is per-room cleaning, and that isn't a gap in its code. On these robots the app sends room selection, room IDs and room names over Eufy's cloud channel. None of it crosses the local Tuya connection, so a local-only integration has no way to see your rooms or ask for one. This integration exists to fill that gap.
+The one thing it can't do is per-room cleaning, and that isn't a gap in its code. On these robots the room names and IDs never cross the plain local Tuya connection: the app reads them over an encrypted peer-to-peer channel and sends room commands through the cloud. This integration exists to fill that gap.
 
 ## How this differs from ha-eufy-robovac-s1-pro
 
 | | [ha-eufy-robovac-s1-pro](https://github.com/tkoba1974/ha-eufy-robovac-s1-pro) | Eufy Clean Rooms (this repo) |
 |---|---|---|
-| Connection | **Local** (Tuya protocol on your LAN) | Cloud (Eufy's MQTT broker, the same channel the app uses) |
+| Connection | **Local** (Tuya protocol on your LAN) | Eufy's MQTT cloud (push), or the Tuya cloud (polling) plus a local peer-to-peer session for the room list |
 | Works without internet | **Yes** | No |
 | Clean a specific room | No | **Yes**, by name or room ID |
 | Room list from the robot's map | No | **Yes**, updates automatically |
@@ -24,8 +24,8 @@ The one thing it can't do is per-room cleaning, and that isn't a gap in its code
 | HA native "clean area" (Assist: "vacuum the kitchen") | No | **Yes** |
 | Start, pause, dock, suction | Yes | Yes |
 | Consumables, cleaning statistics, auto-return switch | **Yes** | No |
-| Robots | S1 Pro | Eufy robots on the newer protobuf protocol that appear in Eufy's MQTT device list (S1 / S1 Pro, X, L, G and C series) |
-| Updates | Polling | Push |
+| Robots | S1 Pro | Eufy robots on the protobuf protocol: MQTT models (S1, X, L, G and C series) and Tuya-only models (S1 Pro / T2080A) |
+| Updates | Polling | Push (MQTT robots) / every 30 s (Tuya robots) |
 
 The two can run side by side on the same robot: keep the local integration for everyday control and stats, and use this one for room cleaning.
 
@@ -51,6 +51,23 @@ The two can run side by side on the same robot: keep the local integration for e
   `vacuum.send_command` with `command: room_clean` and `params: {rooms: [...]}` works too.
 - **Sensors**: battery, current task, room count (the room IDs and names are in its attributes) and error code.
 
+## How it connects
+
+Eufy runs two clouds, and your robot is on one of them. The integration works out which at setup; you only ever log in with your Eufy account.
+
+| | MQTT robots (S1, X, L, G, C series) | Tuya robots (S1 Pro / T2080A) |
+|---|---|---|
+| Commands | Eufy's MQTT broker | Tuya cloud |
+| Status | Pushed as it changes | Polled every 30 seconds |
+| Room list | From the robot's cloud messages | Read from the robot itself over your local network (P2P), at startup and on **Refresh rooms** |
+| Needs Home Assistant on the same network as the dock | No | Only for the room list; commands and status work from anywhere |
+
+For Tuya robots the dock is found automatically on the local network. If Home Assistant sits on another subnet, set the dock's IP address under the integration's **Configure** button. A few things worth knowing:
+
+- The dock accepts only a handful of local connections, and a local integration (such as ha-eufy-robovac-s1-pro) and the Eufy app's map view each hold one. If the dock is busy the room refresh waits a minute and tries again, up to five times; nothing breaks, the last known rooms stay in use.
+- Each room refresh opens one short session on the robot, which is why it runs only when the saved list is older than a day or you ask for it.
+- Room cleaning on the S1 Pro uses the robot's local map id and zero-based room order, which is what its firmware expects (other projects' cloud map id and one-based order are why their room cleans landed in the wrong room).
+
 ## Installation
 
 ### HACS
@@ -69,11 +86,12 @@ Copy `custom_components/eufy_clean_rooms` into your `config/custom_components/` 
 2. Log in with the email and password you use in the Eufy Clean app.
 3. Pick your robot.
 
-If the room list is empty after setup, open the map in the Eufy Clean app once. The robot publishes its rooms when the map is viewed, and the integration saves them so they survive restarts. The **Refresh rooms** action re-reads them from the cloud.
+If the room list is empty after setup on an MQTT robot, open the map in the Eufy Clean app once. The robot publishes its rooms when the map is viewed, and the integration saves them so they survive restarts. The **Refresh rooms** action re-reads them (from the cloud for MQTT robots, from the robot over your network for Tuya robots).
 
 ## Troubleshooting
 
-- **"This account has no robots on Eufy's MQTT cloud"**: your robot is an older Tuya-only model. It doesn't appear in the device list this integration uses, so it isn't supported.
+- **"This account has no robots"**: the account you logged in with has no robot on either of Eufy's clouds. Check the robot is set up in the Eufy Clean app with the same email.
+- **Repair: "Can't reach \<robot\> on your network"**: a Tuya robot's dock couldn't be reached for the room list. Home Assistant and the dock must be on the same network, or set the dock's IP address under **Configure**. Commands and status still work; the last known rooms stay in use.
 - **A room clean starts but ignores vacuum/mop**: some models take the clean type from the app's own setting. Set it in the app and file an issue with your model number.
 - **Debug logs**: add this to `configuration.yaml`, reproduce the problem, then attach the log to an issue.
 
@@ -85,12 +103,13 @@ If the room list is empty after setup, open the map in the Eufy Clean app once. 
 
 ## Status
 
-Version 0.1.0 is new. The protocol code reproduces the exact commands the Eufy app sends an S1 Pro, and the integration has a test suite that runs against Home Assistant. Reports from other models are welcome, good or bad, in [Issues](https://github.com/ajachierno/ha-eufy-clean-rooms/issues).
+Version 0.2.0 adds the Tuya path, developed and tested on an S1 Pro (T2080A); the MQTT path is unchanged from 0.1. The integration has a test suite that runs against Home Assistant. Reports from other models are welcome, good or bad, in [Issues](https://github.com/ajachierno/ha-eufy-clean-rooms/issues).
 
 ## Credits
 
-- [tkoba1974/ha-eufy-robovac-s1-pro](https://github.com/tkoba1974/ha-eufy-robovac-s1-pro) for the inspiration, and for the S1 Pro command captures that confirmed which protocol the robot speaks.
-- [martijnpoppen/eufy-clean](https://github.com/martijnpoppen/eufy-clean) (Copyright (c) Martijn Poppen) and [jeppesens/eufy-clean](https://github.com/jeppesens/eufy-clean) for documenting Eufy's cloud endpoints and protobuf message layouts. No code from either project is included; see [NOTICE.md](NOTICE.md).
+- [tkoba1974/ha-eufy-robovac-s1-pro](https://github.com/tkoba1974/ha-eufy-robovac-s1-pro) for the inspiration, the S1 Pro command captures that confirmed which protocol the robot speaks, and [issue #24](https://github.com/tkoba1974/ha-eufy-robovac-s1-pro/issues/24) on the S1 Pro's timer and map-edit messages.
+- [martijnpoppen/eufy-clean](https://github.com/martijnpoppen/eufy-clean) (Copyright (c) Martijn Poppen) and [jeppesens/eufy-clean](https://github.com/jeppesens/eufy-clean) for documenting Eufy's cloud endpoints and protobuf message layouts, and for the Tuya cloud client this integration ports.
+- hclaria and chrisns for the local P2P map-channel client ([PR #169](https://github.com/jeppesens/eufy-clean/pull/169), [PR #182](https://github.com/jeppesens/eufy-clean/pull/182)), vendored here for the room list, and gurt-il for pinning down the S1 Pro's local map id ([PR #166](https://github.com/jeppesens/eufy-clean/pull/166)). See [NOTICE.md](NOTICE.md) and [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
 
 Not affiliated with or endorsed by Anker or eufy.
 

@@ -1,4 +1,4 @@
-"""Eufy Clean Rooms: cloud MQTT control of Eufy robovacs, including per-room cleaning."""
+"""Eufy Clean Rooms: cloud control of Eufy robovacs (MQTT or Tuya), including per-room cleaning."""
 
 from __future__ import annotations
 
