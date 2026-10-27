@@ -183,3 +183,72 @@ async def test_dock_host_from_options_skips_discovery(hass: HomeAssistant, cloud
 async def test_tuya_unload(hass: HomeAssistant, cloud, tuya, p2p) -> None:
     entry = await setup(hass)
     assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+# ---------------------------------------------------------------- config flow + options
+
+from homeassistant import config_entries  # noqa: E402
+from homeassistant.data_entry_flow import FlowResultType  # noqa: E402
+
+from custom_components.eufy_clean_rooms.tuya import TuyaError  # noqa: E402
+
+MQTT_DEVICE = {"device_sn": "T2320XYZ", "device_model": "T2320", "device_name": "Upstairs", "dps": {}}
+
+
+async def _start_flow(hass: HomeAssistant):
+    result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": config_entries.SOURCE_USER})
+    return await hass.config_entries.flow.async_configure(result["flow_id"], {CONF_EMAIL: "a@b.c", CONF_PASSWORD: "pw"})
+
+
+async def test_config_flow_lists_tuya_robot(hass: HomeAssistant, cloud, tuya) -> None:
+    result = await _start_flow(hass)
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["title"] == "Robot"
+    data = result["data"]
+    assert data["transport"] == "tuya" and data["device_sn"] == SN
+    assert data["device_model"] == "T2080A" and data["tuya_region"] == "US"
+
+
+async def test_config_flow_mixed_account_offers_both(hass: HomeAssistant, cloud, tuya) -> None:
+    cloud.has_user_center = True
+    cloud.get_mqtt_devices = AsyncMock(return_value=[MQTT_DEVICE])
+    result = await _start_flow(hass)
+    assert result["type"] is FlowResultType.FORM and result["step_id"] == "device"
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], {"device_sn": "T2320XYZ"})
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["data"]["transport"] == "mqtt" and result["data"]["device_model"] == "T2320"
+
+
+async def test_config_flow_tuya_login_failure_still_offers_mqtt(hass: HomeAssistant, cloud, tuya) -> None:
+    cloud.has_user_center = True
+    cloud.get_mqtt_devices = AsyncMock(return_value=[MQTT_DEVICE])
+    tuya.login.side_effect = TuyaError("USER_NOT_EXISTS", "no")
+    result = await _start_flow(hass)
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["data"]["transport"] == "mqtt"
+
+
+async def test_config_flow_no_robots_anywhere(hass: HomeAssistant, cloud, tuya) -> None:
+    tuya.get_devices.return_value = []
+    result = await _start_flow(hass)
+    assert result["errors"] == {"base": "no_devices"}
+
+
+async def test_options_flow_sets_dock_host(hass: HomeAssistant, cloud, tuya, p2p) -> None:
+    entry = await setup(hass)
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    assert result["type"] is FlowResultType.FORM and result["step_id"] == "init"
+    result = await hass.config_entries.options.async_configure(result["flow_id"], {"dock_host": "192.0.2.9"})
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    await hass.async_block_till_done()
+    assert entry.data["dock_host"] == "192.0.2.9"
+    if task := entry.runtime_data.rooms_task:
+        await task
+    assert p2p.probe.await_args.args == ("192.0.2.9",)
+
+
+async def test_options_flow_aborts_for_mqtt_entry(hass: HomeAssistant, cloud, tuya, p2p) -> None:
+    entry = make_entry(transport="mqtt")
+    entry.add_to_hass(hass)
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    assert result["type"] is FlowResultType.ABORT and result["reason"] == "not_tuya"

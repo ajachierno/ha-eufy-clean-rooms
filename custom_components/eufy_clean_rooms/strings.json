@@ -26,7 +26,7 @@
     "error": {
       "invalid_auth": "Eufy rejected the login ({details}). Check the email and password you use in the Eufy app. After several wrong passwords Eufy can lock logins for a while.",
       "cannot_connect": "Couldn't finish logging in to Eufy ({details}). Try again in a minute.",
-      "no_devices": "This account has no robots on Eufy's MQTT cloud. Older Tuya-only models aren't supported.",
+      "no_devices": "This account has no robots. Make sure the robot is set up in the Eufy Clean app with this account.",
       "unknown": "Unexpected error ({details}). Details are in the Home Assistant log."
     },
     "abort": {
@@ -85,13 +85,27 @@
     },
     "refresh_rooms": {
       "name": "Refresh rooms",
-      "description": "Re-read the robot's room list from the Eufy cloud."
+      "description": "Re-read the robot's room list (from the robot over the local network, or from the Eufy cloud)."
     }
   },
   "issues": {
     "dock_unreachable": {
       "title": "Can't reach {name} on your network",
       "description": "Eufy Clean Rooms reads the room list from the robot over your local network and can't connect to its dock. Make sure Home Assistant and the dock are on the same network, or set the dock's IP address in the integration's options. The last known rooms are still in use."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Dock address",
+        "description": "The room list is read from the robot over your local network. Normally the dock is found automatically; set its IP address here if Home Assistant can't find it (for example on a different subnet). Leave empty to use discovery.",
+        "data": {
+          "dock_host": "Dock IP address (optional)"
+        }
+      }
+    },
+    "abort": {
+      "not_tuya": "This robot uses Eufy's MQTT cloud; there is nothing to configure."
     }
   }
 }
