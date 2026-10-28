@@ -11,7 +11,7 @@ COMPONENT = ROOT / "custom_components" / "eufy_clean_rooms"
 
 def test_manifest_release_fields() -> None:
     manifest = json.loads((COMPONENT / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["version"] == "0.2.2"
+    assert manifest["version"] == "0.2.3"
     assert manifest["iot_class"] == "cloud_polling"
     assert manifest["requirements"] == ["paho-mqtt>=2.0.0"]
     keys = list(manifest)

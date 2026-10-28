@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from ipaddress import ip_interface
 import logging
 import time
 from typing import Any
 
+from homeassistant.components import network
 from homeassistant.components.vacuum import VacuumActivity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
@@ -47,7 +49,15 @@ from .const import (
     TUYA_REGION_ORDER,
     ZERO_BASED_ORDER_MODELS,
 )
-from .rooms_p2p import DockBusy, DockUnreachable, RoomsUnavailable, fetch_rooms, find_dock_host, probe_dock
+from .rooms_p2p import (
+    DockBusy,
+    DockUnreachable,
+    RoomsUnavailable,
+    fetch_rooms,
+    find_dock_host,
+    probe_dock,
+    scan_for_dock,
+)
 from .transport import MqttTransport, Transport, TuyaTransport
 from .tuya import TuyaCloud, TuyaError, async_tuya_login
 
@@ -355,7 +365,7 @@ class EufyCleanCoordinator(DataUpdateCoordinator[RobotState]):
         configured = self.config_entry.data.get(CONF_DOCK_HOST)
         host = configured or self._dock_host
         if not host:
-            host = await find_dock_host(self.device_sn)
+            host = await self._async_find_dock()
             if not host:
                 self._dock_unreachable("the dock did not answer discovery on this network")
                 return
@@ -365,7 +375,7 @@ class EufyCleanCoordinator(DataUpdateCoordinator[RobotState]):
         if result != "ok" and not configured:
             # A remembered address may be stale (DHCP moved the dock, or another
             # device now answers there); ask the network once before giving up.
-            fresh = await find_dock_host(self.device_sn)
+            fresh = await self._async_find_dock()
             if fresh and fresh != host:
                 _LOGGER.info("Dock of %s moved from %s to %s", self.config_entry.title, host, fresh)
                 host = self._dock_host = fresh
@@ -397,6 +407,29 @@ class EufyCleanCoordinator(DataUpdateCoordinator[RobotState]):
         self._p2p_failures = 0
         ir.async_delete_issue(self.hass, DOMAIN, self._issue_id)
         self._set_rooms(table, "p2p")
+
+    async def _async_find_dock(self) -> str | None:
+        """The dock's address: its discovery broadcast, else a scan of the LAN."""
+        if host := await find_dock_host(self.device_sn):
+            return host
+        # Broadcasts go unheard when another Tuya integration holds UDP 6667.
+        hosts = await self._async_lan_hosts()
+        if host := await scan_for_dock(hosts, self.device_sn, self._local_key):
+            _LOGGER.info("Found the dock of %s at %s by scanning the LAN", self.config_entry.title, host)
+        return host
+
+    async def _async_lan_hosts(self) -> list[str]:
+        """Every other address on HA's enabled IPv4 networks (each /22 or smaller)."""
+        hosts: list[str] = []
+        for adapter in await network.async_get_adapters(self.hass):
+            if not adapter["enabled"]:
+                continue
+            for ipv4 in adapter["ipv4"]:
+                iface = ip_interface(f"{ipv4['address']}/{ipv4['network_prefix']}")
+                if iface.is_loopback or iface.network.prefixlen < 22:
+                    continue
+                hosts += [str(h) for h in iface.network.hosts() if h != iface.ip]
+        return hosts
 
     def _dock_unreachable(self, reason: str) -> None:
         self._p2p_failures += 1

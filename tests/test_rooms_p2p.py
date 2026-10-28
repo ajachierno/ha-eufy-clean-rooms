@@ -12,7 +12,7 @@ import pytest
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from custom_components.eufy_clean_rooms import proto, rooms_p2p
-from custom_components.eufy_clean_rooms.p2p import P2PError, P2PRefused
+from custom_components.eufy_clean_rooms.p2p import P2PError, P2PRefused, framing
 from custom_components.eufy_clean_rooms.p2p.streams import MAP_STREAM
 from custom_components.eufy_clean_rooms.rooms_p2p import (
     DockBusy,
@@ -132,3 +132,47 @@ def test_decrypt_discovery_datagram() -> None:
     datagram = b"\x00" * 20 + body + b"\x00" * 8
     assert rooms_p2p._parse_discovery(datagram) == {"gwId": "dev1", "ip": "192.0.2.5", "version": "3.3"}
     assert rooms_p2p._parse_discovery(b"garbage") is None
+
+
+DOCK_KEY = "0123456789abcdef"
+
+
+async def _fake_tuya_device(key: str):
+    """A localhost server that answers any frame like a Tuya 3.3 device keyed with `key`."""
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        await reader.read(4096)
+        reply = framing.encode_frame(key.encode(), framing.CMD_DP_QUERY, {"dps": {"1": True}}, 1)
+        # Devices put a 4-byte return code ahead of the ciphertext.
+        body = b"\x00\x00\x00\x00" + reply[16:-8]
+        head = reply[:12] + (len(body) + 8).to_bytes(4, "big")
+        writer.write(head + body + reply[-8:])
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    return server, server.sockets[0].getsockname()[1]
+
+
+async def test_is_dock_matches_only_its_own_key() -> None:
+    server, port = await _fake_tuya_device(DOCK_KEY)
+    async with server:
+        with patch.object(rooms_p2p, "DOCK_PORT", port):
+            assert await rooms_p2p.is_dock("127.0.0.1", "dev", DOCK_KEY)
+            assert not await rooms_p2p.is_dock("127.0.0.1", "dev", "fedcba9876543210")
+
+
+async def test_is_dock_closed_port() -> None:
+    with patch.object(rooms_p2p, "DOCK_PORT", 9):
+        assert not await rooms_p2p.is_dock("127.0.0.1", "dev", DOCK_KEY, timeout=0.5)
+
+
+async def test_scan_for_dock_returns_the_match() -> None:
+    async def fake_is_dock(host, device_id, local_key):
+        return host == "192.0.2.7"
+
+    with patch.object(rooms_p2p, "is_dock", fake_is_dock):
+        hosts = [f"192.0.2.{i}" for i in range(1, 20)]
+        assert await rooms_p2p.scan_for_dock(hosts, "dev", DOCK_KEY) == "192.0.2.7"
+        assert await rooms_p2p.scan_for_dock(["192.0.2.1"], "dev", DOCK_KEY) is None
+        assert await rooms_p2p.scan_for_dock(hosts, "dev", "") is None

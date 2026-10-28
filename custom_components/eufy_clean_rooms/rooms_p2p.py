@@ -17,12 +17,13 @@ import json
 import logging
 import socket
 import time
+from collections.abc import Iterable
 from typing import Any
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from . import proto
-from .p2p import P2PError, P2PRefused, P2PSession
+from .p2p import P2PError, P2PRefused, P2PSession, framing
 from .p2p.streams import MAP_STREAM
 
 _LOGGER = logging.getLogger(__name__)
@@ -88,7 +89,8 @@ def _listen_for_dock(device_id: str, timeout: float) -> str | None:
             if data and data.get("gwId") == device_id:
                 return address
     except OSError as err:
-        _LOGGER.debug("Dock discovery not possible: %s", err)
+        # Typically another Tuya integration (localtuya, tuya-local) owns the port.
+        _LOGGER.info("Can't listen for dock broadcasts on UDP %s: %s", DISCOVERY_PORT, err)
     finally:
         sock.close()
     return None
@@ -98,6 +100,71 @@ async def find_dock_host(device_id: str, timeout: float = 6.0) -> str | None:
     """Find the dock's LAN address from Tuya's discovery broadcasts (UDP 6667)."""
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, _listen_for_dock, device_id, timeout)
+
+
+def _decrypts_with(local_key: bytes, body: bytes) -> bool:
+    """True when `body` is AES-ECB ciphertext under `local_key` with clean padding and text."""
+    if len(body) % 16 == 4:  # device frames lead with a 4-byte return code
+        body = body[4:]
+    if not body or len(body) % 16:
+        return False
+    dec = Cipher(algorithms.AES(local_key), modes.ECB()).decryptor()
+    plain = dec.update(body) + dec.finalize()
+    pad = plain[-1]
+    if not 1 <= pad <= 16 or plain[-pad:] != bytes([pad]) * pad:
+        return False
+    text = plain[:-pad]
+    if text[:3] == b"3.3":
+        text = text[15:]
+    return all(32 <= b < 127 for b in text)
+
+
+async def is_dock(host: str, device_id: str, local_key: str, timeout: float = 2.0) -> bool:
+    """Ask `host` for its status; only the dock's reply decrypts under its local key."""
+    key = local_key.encode()
+    query = {"gwId": device_id, "devId": device_id, "uid": device_id, "t": str(int(time.time()))}
+    try:
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, DOCK_PORT), timeout)
+    except (TimeoutError, OSError):
+        return False
+    try:
+        writer.write(framing.encode_frame(key, framing.CMD_DP_QUERY, query, 1))
+        await writer.drain()
+        buffer = b""
+        async with asyncio.timeout(timeout):
+            while True:
+                chunk = await reader.read(4096)
+                if not chunk:
+                    return False
+                buffer += chunk
+                start = buffer.find(framing.PREFIX.to_bytes(4, "big"))
+                if start < 0 or len(buffer) < start + 16:
+                    continue
+                end = start + 16 + int.from_bytes(buffer[start + 12 : start + 16], "big")
+                if len(buffer) >= end:
+                    return _decrypts_with(key, buffer[start + 16 : end - 8])
+    except (TimeoutError, OSError):
+        return False
+    finally:
+        writer.close()
+
+
+async def scan_for_dock(
+    hosts: Iterable[str], device_id: str, local_key: str, *, concurrency: int = 32
+) -> str | None:
+    """Find the dock by asking every host on the LAN; for when broadcasts can't be heard."""
+    if not local_key:
+        return None
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def check(host: str) -> str | None:
+        async with semaphore:
+            return host if await is_dock(host, device_id, local_key) else None
+
+    for found in await asyncio.gather(*(check(h) for h in hosts)):
+        if found:
+            return found
+    return None
 
 
 async def fetch_rooms(

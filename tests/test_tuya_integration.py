@@ -397,3 +397,22 @@ async def test_tuya_refetches_rooms_not_from_p2p(hass: HomeAssistant, cloud, tuy
     async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=2))  # delayed store write
     await hass.async_block_till_done()
     assert hass_storage[f"{DOMAIN}.{SN}"]["data"]["source"] == "p2p"
+
+
+async def test_dock_found_by_lan_scan_when_broadcasts_unheard(hass: HomeAssistant, cloud, tuya, p2p) -> None:
+    """Another Tuya integration owning UDP 6667 means no broadcast; scan HA's subnet instead."""
+    p2p.find.return_value = None
+    adapters = [
+        {"enabled": True, "ipv4": [{"address": "192.0.2.10", "network_prefix": 24}]},
+        {"enabled": True, "ipv4": [{"address": "10.0.0.2", "network_prefix": 8}]},  # too big to scan
+        {"enabled": False, "ipv4": [{"address": "198.51.100.2", "network_prefix": 24}]},
+    ]
+    with patch("custom_components.eufy_clean_rooms.coordinator.network.async_get_adapters", AsyncMock(return_value=adapters)), \
+         patch("custom_components.eufy_clean_rooms.coordinator.scan_for_dock", AsyncMock(return_value="192.0.2.42")) as scan:
+        await setup(hass)
+    hosts, device_id, local_key = scan.await_args.args
+    assert len(hosts) == 253 and "192.0.2.10" not in hosts and "192.0.2.42" in hosts
+    assert (device_id, local_key) == (SN, "k")
+    p2p.probe.assert_awaited_once_with("192.0.2.42")
+    assert hass.states.get("button.robot_vacuum_laundry_room")
+    assert issue(hass) is None

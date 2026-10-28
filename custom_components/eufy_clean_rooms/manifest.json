@@ -5,6 +5,9 @@
     "@ajachierno"
   ],
   "config_flow": true,
+  "dependencies": [
+    "network"
+  ],
   "documentation": "https://github.com/ajachierno/ha-eufy-clean-rooms",
   "integration_type": "device",
   "iot_class": "cloud_polling",
@@ -12,5 +15,5 @@
   "requirements": [
     "paho-mqtt>=2.0.0"
   ],
-  "version": "0.2.2"
+  "version": "0.2.3"
 }
