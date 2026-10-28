@@ -107,6 +107,7 @@ class EufyCleanCoordinator(DataUpdateCoordinator[RobotState]):
         self._local_key = ""
         self._dock_host: str | None = None
         self._rooms_fetched_at = 0.0
+        self._rooms_source: str | None = None  # "p2p" or "dps": where the room list came from
         self._rooms_lock = asyncio.Lock()
         self._p2p_failures = 0
         self._retry_unsub: CALLBACK_TYPE | None = None
@@ -120,10 +121,15 @@ class EufyCleanCoordinator(DataUpdateCoordinator[RobotState]):
     async def async_start(self) -> None:
         """Log in, load saved rooms, seed state from the cloud, open the transport."""
         if saved := await self._store.async_load():
-            self.data.map_id = saved.get("map_id", 0)
-            self.data.rooms = [proto.Room(r["id"], r["name"]) for r in saved.get("rooms", [])]
-            self._rooms_fetched_at = float(saved.get("fetched_at") or 0)
             self._dock_host = saved.get("dock_host")
+            self._rooms_source = saved.get("source")
+            # On Tuya robots only a P2P room list carries the local map id the
+            # firmware accepts; anything else (0.2.0/0.2.1 saved the cloud
+            # snapshot) is dropped and fetched again.
+            if self.transport_kind != TRANSPORT_TUYA or self._rooms_source == "p2p":
+                self.data.map_id = saved.get("map_id", 0)
+                self.data.rooms = [proto.Room(r["id"], r["name"]) for r in saved.get("rooms", [])]
+                self._rooms_fetched_at = float(saved.get("fetched_at") or 0)
 
         try:
             await self.cloud.login()
@@ -269,14 +275,18 @@ class EufyCleanCoordinator(DataUpdateCoordinator[RobotState]):
         if DPS_ERROR in dps:
             state.error_codes = proto.parse_error_code(dps[DPS_ERROR])
 
-        if isinstance(value := dps.get(DPS_ROOMS), str):
+        # On Tuya robots the cloud's copy of DPS 165 is not the local room table
+        # (an S1 Pro reports one placeholder room on the cloud map id); the
+        # dock's P2P map stream is the only room source there.
+        if self.transport_kind != TRANSPORT_TUYA and isinstance(value := dps.get(DPS_ROOMS), str):
             if (table := proto.parse_room_table(value)) and table.rooms:
-                self._set_rooms(table)
+                self._set_rooms(table, "dps")
 
-    def _set_rooms(self, table: proto.RoomTable) -> None:
+    def _set_rooms(self, table: proto.RoomTable, source: str) -> None:
         state = self.data
         new = [(r.id, r.name) for r in table.rooms]
         self._rooms_fetched_at = time.time()
+        self._rooms_source = source
         if new == [(r.id, r.name) for r in state.rooms] and table.map_id == state.map_id:
             self._save_rooms()
             return
@@ -292,6 +302,7 @@ class EufyCleanCoordinator(DataUpdateCoordinator[RobotState]):
                 "map_id": state.map_id,
                 "rooms": [{"id": r.id, "name": r.name} for r in state.rooms],
                 "fetched_at": self._rooms_fetched_at,
+                "source": self._rooms_source,
                 "dock_host": self._dock_host,
             },
             1,
@@ -385,7 +396,7 @@ class EufyCleanCoordinator(DataUpdateCoordinator[RobotState]):
             return
         self._p2p_failures = 0
         ir.async_delete_issue(self.hass, DOMAIN, self._issue_id)
-        self._set_rooms(table)
+        self._set_rooms(table, "p2p")
 
     def _dock_unreachable(self, reason: str) -> None:
         self._p2p_failures += 1

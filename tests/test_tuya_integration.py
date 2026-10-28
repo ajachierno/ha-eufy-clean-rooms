@@ -106,11 +106,13 @@ async def setup(hass: HomeAssistant, entry: MockConfigEntry | None = None) -> Mo
     return entry
 
 
-def seed_store(hass_storage, rooms: list[tuple[int, str]], fetched_at: float) -> None:
-    hass_storage[f"{DOMAIN}.{SN}"] = {
-        "version": 1, "key": f"{DOMAIN}.{SN}",
-        "data": {"map_id": 1, "rooms": [{"id": i, "name": n} for i, n in rooms], "fetched_at": fetched_at},
-    }
+def seed_store(
+    hass_storage, rooms: list[tuple[int, str]], fetched_at: float, map_id: int = 1, source: str | None = "p2p"
+) -> None:
+    data = {"map_id": map_id, "rooms": [{"id": i, "name": n} for i, n in rooms], "fetched_at": fetched_at}
+    if source:
+        data["source"] = source
+    hass_storage[f"{DOMAIN}.{SN}"] = {"version": 1, "key": f"{DOMAIN}.{SN}", "data": data}
 
 
 def issue(hass: HomeAssistant):
@@ -364,3 +366,34 @@ async def test_stored_region_failure_falls_back_to_all_regions(hass: HomeAssista
     entry = await setup(hass)
     assert [c.args[2] for c in tuya.login.await_args_list] == [("US",), ("EU", "US")]
     assert entry.data["tuya_region"] == "US"
+
+
+# The cloud's DPS 165 on an S1 Pro: one placeholder room on the cloud map id.
+CLOUD_ROOMS_165 = proto.to_b64(
+    proto.f_bytes(1, proto.f_varint(1, 2178) + proto.f_bytes(2, proto.f_varint(1, 0)))
+)
+
+
+async def test_tuya_ignores_cloud_room_snapshot(hass: HomeAssistant, cloud, tuya, p2p) -> None:
+    """On Tuya robots the cloud's DPS 165 is not the local room table; only P2P counts."""
+    device = {**TUYA_DEVICE, "dps": {**TUYA_DEVICE["dps"], "165": CLOUD_ROOMS_165}}
+    tuya.get_devices.return_value = [device]
+    tuya.get_dps.return_value = dict(device["dps"])
+    await setup(hass)
+    assert p2p.fetch.await_count == 1
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=31))
+    await hass.async_block_till_done()
+    state = hass.states.get("vacuum.robot")
+    assert state.attributes["map_id"] == 1
+    assert [r["name"] for r in state.attributes["rooms"]] == ["Laundry room", "Room 0"]
+
+
+async def test_tuya_refetches_rooms_not_from_p2p(hass: HomeAssistant, cloud, tuya, p2p, hass_storage) -> None:
+    """A fresh saved list that didn't come from P2P (0.2.0/0.2.1 cloud snapshot) is replaced."""
+    seed_store(hass_storage, [(0, "Room 0")], fetched_at=time.time(), map_id=2178, source=None)
+    await setup(hass)
+    assert p2p.fetch.await_count == 1
+    assert hass.states.get("vacuum.robot").attributes["map_id"] == 1
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=2))  # delayed store write
+    await hass.async_block_till_done()
+    assert hass_storage[f"{DOMAIN}.{SN}"]["data"]["source"] == "p2p"
