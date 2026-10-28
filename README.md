@@ -62,7 +62,7 @@ Eufy runs two clouds, and your robot is on one of them. The integration works ou
 | Room list | From the robot's cloud messages | Read from the robot itself over your local network (P2P), at startup and on **Refresh rooms** |
 | Needs Home Assistant on the same network as the dock | No | Only for the room list; commands and status work from anywhere |
 
-For Tuya robots the dock is found automatically on the local network. If Home Assistant sits on another subnet, set the dock's IP address under the integration's **Configure** button. A few things worth knowing:
+For Tuya robots the dock is found automatically on the local network: first from its discovery broadcast, and if that can't be heard (another Tuya integration such as localtuya or tuya-local already listens on that port), by checking the hosts on Home Assistant's own network for the dock. If Home Assistant sits on another subnet, set the dock's IP address under the integration's **Configure** button. A few things worth knowing:
 
 - The dock accepts only a handful of local connections, and a local integration (such as ha-eufy-robovac-s1-pro) and the Eufy app's map view each hold one. If the dock is busy the room refresh waits a minute and tries again, up to five times; nothing breaks, the last known rooms stay in use.
 - Each room refresh opens one short session on the robot, which is why it runs only when the saved list is older than a day or you ask for it.
@@ -71,6 +71,8 @@ For Tuya robots the dock is found automatically on the local network. If Home As
 ## Installation
 
 ### HACS
+
+Eufy Clean Rooms is submitted to the HACS default list. Until it's listed there, add it as a custom repository:
 
 1. HACS → three-dot menu → **Custom repositories**.
 2. Add `https://github.com/ajachierno/ha-eufy-clean-rooms` with category **Integration**.
@@ -91,7 +93,8 @@ If the room list is empty after setup on an MQTT robot, open the map in the Eufy
 ## Troubleshooting
 
 - **"This account has no robots"**: the account you logged in with has no robot on either of Eufy's clouds. Check the robot is set up in the Eufy Clean app with the same email.
-- **Repair: "Can't reach \<robot\> on your network"**: a Tuya robot's dock couldn't be reached for the room list. Home Assistant and the dock must be on the same network, or set the dock's IP address under **Configure**. Commands and status still work; the last known rooms stay in use.
+- **Repair: "Can't reach \<robot\> on your network"**: a Tuya robot's dock couldn't be reached for the room list. Home Assistant and the dock must be on the same network, or set the dock's IP address under **Configure** (the dock's address is in your router's client list). Commands and status still work; the last known rooms stay in use.
+- **Rooms called "Room 0", "Room 1"…**: the room has no name in the Eufy Clean app. Name it there and press **Refresh rooms**.
 - **A room clean starts but ignores vacuum/mop**: some models take the clean type from the app's own setting. Set it in the app and file an issue with your model number.
 - **Debug logs**: add this to `configuration.yaml`, reproduce the problem, then attach the log to an issue.
 
@@ -103,7 +106,7 @@ If the room list is empty after setup on an MQTT robot, open the map in the Eufy
 
 ## Status
 
-Version 0.2.0 adds the Tuya path, developed and tested on an S1 Pro (T2080A); the MQTT path is unchanged from 0.1. The integration has a test suite that runs against Home Assistant. Reports from other models are welcome, good or bad, in [Issues](https://github.com/ajachierno/ha-eufy-clean-rooms/issues).
+The 0.2 series adds the Tuya path, developed and tested on an S1 Pro (T2080A), including setups where localtuya runs alongside; the MQTT path is unchanged from 0.1. The integration has a test suite that runs against Home Assistant. Reports from other models are welcome, good or bad, in [Issues](https://github.com/ajachierno/ha-eufy-clean-rooms/issues).
 
 ## Credits
 

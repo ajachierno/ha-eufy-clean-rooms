@@ -182,6 +182,9 @@ class TuyaCloud:
         try:
             async with self._session.get(self.endpoint, params=params, timeout=_TIMEOUT) as resp:
                 body = await resp.json(content_type=None)
+        except aiohttp.ClientResponseError as err:
+            # Its str() carries the request URL, and with it the sid and signed params.
+            raise TuyaError("NETWORK", f"{action}: HTTP {err.status} {err.message}") from None
         except (aiohttp.ClientError, TimeoutError, ValueError) as err:
             raise TuyaError("NETWORK", f"{action}: {err}") from err
         if not isinstance(body, dict):

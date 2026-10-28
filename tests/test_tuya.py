@@ -174,3 +174,22 @@ async def test_login_redirect_keeps_a_known_region_key(hass: HomeAssistant, aioc
     })
     client = await async_tuya_login(async_get_clientsession(hass), "uid-1")
     assert client.region == "US" and client.endpoint == TUYA_REGIONS["US"]
+
+
+async def test_http_error_message_leaves_out_the_request_url() -> None:
+    """aiohttp puts the full URL (sid, signed params) in ClientResponseError; it must not reach the log."""
+    import aiohttp
+    from yarl import URL
+
+    url = URL("https://a1.tuyaus.com/api.json?a=tuya.m.location.list&sid=SECRETSID&sign=abc")
+    info = aiohttp.RequestInfo(url, "GET", {}, url)
+    err = aiohttp.ClientResponseError(info, (), status=502, message="Bad Gateway")
+
+    session = MagicMock()
+    session.get.side_effect = err
+    client = TuyaCloud(session, "US")
+    client.sid = "SECRETSID"
+    with pytest.raises(TuyaError) as raised:
+        await client.request("tuya.m.location.list")
+    assert "SECRETSID" not in str(raised.value) and "sign=" not in str(raised.value)
+    assert "502" in str(raised.value)
