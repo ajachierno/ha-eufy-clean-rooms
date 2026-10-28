@@ -81,8 +81,18 @@ def _first(msg: dict[int, list[Any]], num: int, default: Any = None) -> Any:
 
 
 def _sub(msg: dict[int, list[Any]], num: int) -> dict[int, list[Any]] | None:
+    """Parse field `num` as a nested message; None if absent or not a message.
+
+    A length-delimited field can just as well be a string or packed scalars,
+    so bytes that don't decode as a message are treated as "not this shape".
+    """
     raw = _first(msg, num)
-    return parse(raw) if isinstance(raw, bytes) else None
+    if not isinstance(raw, bytes):
+        return None
+    try:
+        return parse(raw)
+    except ValueError:
+        return None
 
 
 def to_b64(message: bytes) -> str:
@@ -412,7 +422,10 @@ def parse_error_code(value: Any) -> list[int]:
                     codes.append(c)
         return codes
 
-    return _codes(2) or _codes(3)
+    try:
+        return _codes(2) or _codes(3)
+    except ValueError:
+        return []
 
 
 def parse_clean_type(value: str) -> str | None:

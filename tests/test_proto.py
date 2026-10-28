@@ -181,3 +181,15 @@ def test_map_edit_rooms_custom() -> None:
     assert proto._first(proto._sub(c, 2), 1) == proto.SUCTIONS["Turbo"]
     assert proto._first(proto._sub(c, 3), 1) == proto.MOP_LEVELS["high"]
     assert proto._first(c, 5) == 2
+
+
+def test_parsers_tolerate_non_message_bytes() -> None:
+    """A bytes field that is not a nested message must not raise (S1 Pro DPS 165)."""
+    junk = b"\x0c"  # field 1, wire type 4: not a message we can parse
+    room_params = proto.f_bytes(1, junk) + proto.f_bytes(2, proto.f_varint(1, 2) + proto.f_bytes(2, b"Kitchen"))
+    table = proto.parse_room_table(delim(room_params + proto.f_varint(3, 1)))
+    assert table.map_id == 1 and [(r.id, r.name) for r in table.rooms] == [(2, "Kitchen")]
+    assert proto.parse_room_table(delim(proto.f_bytes(1, junk))) is None
+    assert proto.parse_work_status(delim(proto.f_bytes(1, junk) + proto.f_varint(2, 5))).state == 5
+    assert proto.parse_clean_type(delim(proto.f_bytes(1, junk))) is None
+    assert proto.parse_error_code(delim(proto.f_bytes(2, b"\x80"))) == []
