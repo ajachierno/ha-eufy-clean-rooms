@@ -6,7 +6,7 @@ import asyncio
 import base64
 import hashlib
 import json
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -137,34 +137,42 @@ def test_decrypt_discovery_datagram() -> None:
 DOCK_KEY = "0123456789abcdef"
 
 
-async def _fake_tuya_device(key: str):
-    """A localhost server that answers any frame like a Tuya 3.3 device keyed with `key`."""
+def _device_reply(key: str) -> bytes:
+    """A DP_QUERY reply as a Tuya 3.3 device keyed with `key` sends it."""
+    reply = framing.encode_frame(key.encode(), framing.CMD_DP_QUERY, {"dps": {"1": True}}, 1)
+    body = bytes(4) + reply[16:-8]  # devices lead with a 4-byte return code
+    return reply[:12] + (len(body) + 8).to_bytes(4, "big") + body + reply[-8:]
 
-    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        await reader.read(4096)
-        reply = framing.encode_frame(key.encode(), framing.CMD_DP_QUERY, {"dps": {"1": True}}, 1)
-        # Devices put a 4-byte return code ahead of the ciphertext.
-        body = b"\x00\x00\x00\x00" + reply[16:-8]
-        head = reply[:12] + (len(body) + 8).to_bytes(4, "big")
-        writer.write(head + body + reply[-8:])
-        await writer.drain()
-        writer.close()
 
-    server = await asyncio.start_server(handle, "127.0.0.1", 0)
-    return server, server.sockets[0].getsockname()[1]
+def _fake_connection(device_key: str):
+    """Patch open_connection with a device that answers in two chunks, as TCP may."""
+    data = _device_reply(device_key)
+
+    async def open_connection(host, port):
+        reader = asyncio.StreamReader()
+        reader.feed_data(data[:10])
+        reader.feed_data(data[10:])
+        reader.feed_eof()
+        writer = MagicMock()
+        writer.drain = AsyncMock()
+        return reader, writer
+
+    return patch("custom_components.eufy_clean_rooms.rooms_p2p.asyncio.open_connection", open_connection)
 
 
 async def test_is_dock_matches_only_its_own_key() -> None:
-    server, port = await _fake_tuya_device(DOCK_KEY)
-    async with server:
-        with patch.object(rooms_p2p, "DOCK_PORT", port):
-            assert await rooms_p2p.is_dock("127.0.0.1", "dev", DOCK_KEY)
-            assert not await rooms_p2p.is_dock("127.0.0.1", "dev", "fedcba9876543210")
+    with _fake_connection(DOCK_KEY):
+        assert await rooms_p2p.is_dock("192.0.2.5", "dev", DOCK_KEY)
+    with _fake_connection("fedcba9876543210"):
+        assert not await rooms_p2p.is_dock("192.0.2.5", "dev", DOCK_KEY)
 
 
 async def test_is_dock_closed_port() -> None:
-    with patch.object(rooms_p2p, "DOCK_PORT", 9):
-        assert not await rooms_p2p.is_dock("127.0.0.1", "dev", DOCK_KEY, timeout=0.5)
+    async def refused(*args, **kwargs):
+        raise ConnectionRefusedError
+
+    with patch("custom_components.eufy_clean_rooms.rooms_p2p.asyncio.open_connection", refused):
+        assert not await rooms_p2p.is_dock("192.0.2.5", "dev", DOCK_KEY)
 
 
 async def test_scan_for_dock_returns_the_match() -> None:
